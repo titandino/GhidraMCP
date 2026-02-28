@@ -21,6 +21,7 @@ import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.services.CodeViewerService;
 import ghidra.app.services.ProgramManager;
+import ghidra.app.util.NamespaceUtils;
 import ghidra.app.util.PseudoDisassembler;
 import ghidra.app.cmd.function.SetVariableNameCmd;
 import ghidra.program.model.symbol.SourceType;
@@ -44,6 +45,15 @@ import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
 import ghidra.framework.options.Options;
+import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.UnionDataType;
+import ghidra.program.model.data.EnumDataType;
+import ghidra.program.model.data.CategoryPath;
+import ghidra.program.model.data.DataTypeComponent;
+import ghidra.program.model.data.DataTypeConflictHandler;
+import ghidra.program.model.data.Structure;
+import ghidra.program.model.data.Union;
+import ghidra.program.model.data.Composite;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -341,6 +351,161 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
         });
 
+        server.createContext("/createNamespace", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String namespacePath = params.get("namespace_path");
+            sendResponse(exchange, createNamespace(namespacePath));
+        });
+
+        server.createContext("/moveSymbolToNamespace", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String namespacePath = params.get("namespace_path");
+            sendResponse(exchange, moveSymbolToNamespace(address, namespacePath));
+        });
+
+        server.createContext("/listNamespaceContents", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String namespacePath = qparams.get("namespace_path");
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, listNamespaceContents(namespacePath, offset, limit));
+        });
+
+        // Data structure management endpoints
+        server.createContext("/createStruct", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            int size = parseIntOrDefault(params.get("size"), 0);
+            String categoryPath = params.get("category_path");
+            sendResponse(exchange, createStruct(name, size, categoryPath));
+        });
+
+        server.createContext("/addStructField", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String structName = params.get("struct_name");
+            int fieldOffset = parseIntOrDefault(params.get("offset"), -1);
+            String fieldType = params.get("field_type");
+            String fieldName = params.get("field_name");
+            int fieldLength = parseIntOrDefault(params.get("field_length"), 0);
+            String comment = params.get("comment");
+            sendResponse(exchange, addStructField(structName, fieldOffset, fieldType, fieldName, fieldLength, comment));
+        });
+
+        server.createContext("/deleteStructField", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String structName = params.get("struct_name");
+            int fieldOffset = parseIntOrDefault(params.get("offset"), -1);
+            sendResponse(exchange, deleteStructField(structName, fieldOffset));
+        });
+
+        server.createContext("/getStructFields", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String structName = qparams.get("struct_name");
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, getStructFields(structName, offset, limit));
+        });
+
+        server.createContext("/createUnion", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            String categoryPath = params.get("category_path");
+            sendResponse(exchange, createUnion(name, categoryPath));
+        });
+
+        server.createContext("/addUnionField", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String unionName = params.get("union_name");
+            String fieldType = params.get("field_type");
+            String fieldName = params.get("field_name");
+            int fieldLength = parseIntOrDefault(params.get("field_length"), 0);
+            String comment = params.get("comment");
+            sendResponse(exchange, addUnionField(unionName, fieldType, fieldName, fieldLength, comment));
+        });
+
+        server.createContext("/createEnum", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            int size = parseIntOrDefault(params.get("size"), 4);
+            String categoryPath = params.get("category_path");
+            sendResponse(exchange, createEnum(name, size, categoryPath));
+        });
+
+        server.createContext("/addEnumValue", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String enumName = params.get("enum_name");
+            String entryName = params.get("entry_name");
+            long value = parseLongOrDefault(params.get("value"), 0);
+            sendResponse(exchange, addEnumValue(enumName, entryName, value));
+        });
+
+        server.createContext("/getDataType", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String name = qparams.get("name");
+            sendResponse(exchange, getDataTypeInfo(name));
+        });
+
+        server.createContext("/applyStructToAddress", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String structName = params.get("struct_name");
+            sendResponse(exchange, applyStructToAddress(address, structName));
+        });
+
+        // Function signature refactoring endpoints
+        server.createContext("/getFunctionSignature", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            sendResponse(exchange, getFunctionSignatureDetails(address));
+        });
+
+        server.createContext("/setReturnType", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String functionAddress = params.get("function_address");
+            String returnType = params.get("return_type");
+            sendResponse(exchange, setFunctionReturnType(functionAddress, returnType));
+        });
+
+        server.createContext("/addParameter", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String functionAddress = params.get("function_address");
+            String paramName = params.get("param_name");
+            String paramType = params.get("param_type");
+            int index = parseIntOrDefault(params.get("index"), -1);
+            sendResponse(exchange, addFunctionParameter(functionAddress, paramName, paramType, index));
+        });
+
+        server.createContext("/removeParameter", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String functionAddress = params.get("function_address");
+            int index = parseIntOrDefault(params.get("index"), -1);
+            sendResponse(exchange, removeFunctionParameter(functionAddress, index));
+        });
+
+        server.createContext("/changeParameterType", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String functionAddress = params.get("function_address");
+            int index = parseIntOrDefault(params.get("index"), -1);
+            String newType = params.get("new_type");
+            sendResponse(exchange, changeFunctionParameterType(functionAddress, index, newType));
+        });
+
+        server.createContext("/renameParameter", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String functionAddress = params.get("function_address");
+            int index = parseIntOrDefault(params.get("index"), -1);
+            String newName = params.get("new_name");
+            sendResponse(exchange, renameFunctionParameter(functionAddress, index, newName));
+        });
+
+        server.createContext("/setCallingConvention", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String functionAddress = params.get("function_address");
+            String convention = params.get("calling_convention");
+            sendResponse(exchange, setFunctionCallingConvention(functionAddress, convention));
+        });
+
         server.setExecutor(null);
         new Thread(() -> {
             try {
@@ -363,7 +528,7 @@ public class GhidraMCPPlugin extends Plugin {
 
         List<String> names = new ArrayList<>();
         for (Function f : program.getFunctionManager().getFunctions(true)) {
-            names.add(f.getName());
+            names.add(getFullyQualifiedFunctionName(f));
         }
         return paginateList(names, offset, limit);
     }
@@ -376,7 +541,7 @@ public class GhidraMCPPlugin extends Plugin {
         for (Symbol symbol : program.getSymbolTable().getAllSymbols(true)) {
             Namespace ns = symbol.getParentNamespace();
             if (ns != null && !ns.isGlobal()) {
-                classNames.add(ns.getName());
+                classNames.add(ns.getName(true));
             }
         }
         // Convert set to list for pagination
@@ -432,8 +597,9 @@ public class GhidraMCPPlugin extends Plugin {
         Set<String> namespaces = new HashSet<>();
         for (Symbol symbol : program.getSymbolTable().getAllSymbols(true)) {
             Namespace ns = symbol.getParentNamespace();
-            if (ns != null && !(ns instanceof GlobalNamespace)) {
-                namespaces.add(ns.getName());
+            while (ns != null && !(ns instanceof GlobalNamespace)) {
+                namespaces.add(ns.getName(true));
+                ns = ns.getParentNamespace();
             }
         }
         List<String> sorted = new ArrayList<>(namespaces);
@@ -468,23 +634,25 @@ public class GhidraMCPPlugin extends Plugin {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
         if (searchTerm == null || searchTerm.isEmpty()) return "Search term is required";
-    
+
         List<String> matches = new ArrayList<>();
+        String lowerSearch = searchTerm.toLowerCase();
         for (Function func : program.getFunctionManager().getFunctions(true)) {
-            String name = func.getName();
-            // simple substring match
-            if (name.toLowerCase().contains(searchTerm.toLowerCase())) {
-                matches.add(String.format("%s @ %s", name, func.getEntryPoint()));
+            String simpleName = func.getName();
+            String qualifiedName = getFullyQualifiedFunctionName(func);
+            if (simpleName.toLowerCase().contains(lowerSearch) ||
+                qualifiedName.toLowerCase().contains(lowerSearch)) {
+                matches.add(String.format("%s @ %s", qualifiedName, func.getEntryPoint()));
             }
         }
-    
+
         Collections.sort(matches);
-    
+
         if (matches.isEmpty()) {
             return "No functions matching '" + searchTerm + "'";
         }
         return paginateList(matches, offset, limit);
-    }    
+    }
 
     // ----------------------------------------------------------------------------------
     // Logic for rename, decompile, etc.
@@ -493,20 +661,16 @@ public class GhidraMCPPlugin extends Plugin {
     private String decompileFunctionByName(String name) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
+        Function func = findFunctionByName(program, name);
+        if (func == null) return "Function not found";
         DecompInterface decomp = new DecompInterface();
         decomp.openProgram(program);
-        for (Function func : program.getFunctionManager().getFunctions(true)) {
-            if (func.getName().equals(name)) {
-                DecompileResults result =
-                    decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
-                if (result != null && result.decompileCompleted()) {
-                    return result.getDecompiledFunction().getC();
-                } else {
-                    return "Decompilation failed";
-                }
-            }
+        DecompileResults result =
+            decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
+        if (result != null && result.decompileCompleted()) {
+            return result.getDecompiledFunction().getC();
         }
-        return "Function not found";
+        return "Decompilation failed";
     }
 
     private boolean renameFunction(String oldName, String newName) {
@@ -518,12 +682,15 @@ public class GhidraMCPPlugin extends Plugin {
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction("Rename function via HTTP");
                 try {
-                    for (Function func : program.getFunctionManager().getFunctions(true)) {
-                        if (func.getName().equals(oldName)) {
+                    Function func = findFunctionByName(program, oldName);
+                    if (func != null) {
+                        NamespacedName nn = resolveNamespacedName(program, newName);
+                        if (nn != null) {
+                            func.getSymbol().setNameAndNamespace(nn.simpleName, nn.namespace, SourceType.USER_DEFINED);
+                        } else {
                             func.setName(newName, SourceType.USER_DEFINED);
-                            successFlag.set(true);
-                            break;
                         }
+                        successFlag.set(true);
                     }
                 }
                 catch (Exception e) {
@@ -554,10 +721,19 @@ public class GhidraMCPPlugin extends Plugin {
                     if (data != null) {
                         SymbolTable symTable = program.getSymbolTable();
                         Symbol symbol = symTable.getPrimarySymbol(addr);
+                        NamespacedName nn = resolveNamespacedName(program, newName);
                         if (symbol != null) {
-                            symbol.setName(newName, SourceType.USER_DEFINED);
+                            if (nn != null) {
+                                symbol.setNameAndNamespace(nn.simpleName, nn.namespace, SourceType.USER_DEFINED);
+                            } else {
+                                symbol.setName(newName, SourceType.USER_DEFINED);
+                            }
                         } else {
-                            symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
+                            if (nn != null) {
+                                symTable.createLabel(addr, nn.simpleName, nn.namespace, SourceType.USER_DEFINED);
+                            } else {
+                                symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
+                            }
                         }
                     }
                 }
@@ -581,14 +757,7 @@ public class GhidraMCPPlugin extends Plugin {
         DecompInterface decomp = new DecompInterface();
         decomp.openProgram(program);
 
-        Function func = null;
-        for (Function f : program.getFunctionManager().getFunctions(true)) {
-            if (f.getName().equals(functionName)) {
-                func = f;
-                break;
-            }
-        }
-
+        Function func = findFunctionByName(program, functionName);
         if (func == null) {
             return "Function not found";
         }
@@ -771,8 +940,8 @@ public class GhidraMCPPlugin extends Plugin {
 
         StringBuilder result = new StringBuilder();
         for (Function func : program.getFunctionManager().getFunctions(true)) {
-            result.append(String.format("%s at %s\n", 
-                func.getName(), 
+            result.append(String.format("%s at %s\n",
+                getFullyQualifiedFunctionName(func),
                 func.getEntryPoint()));
         }
 
@@ -958,7 +1127,12 @@ public class GhidraMCPPlugin extends Plugin {
                 return;
             }
 
-            func.setName(newName, SourceType.USER_DEFINED);
+            NamespacedName nn = resolveNamespacedName(program, newName);
+            if (nn != null) {
+                func.getSymbol().setNameAndNamespace(nn.simpleName, nn.namespace, SourceType.USER_DEFINED);
+            } else {
+                func.setName(newName, SourceType.USER_DEFINED);
+            }
             success.set(true);
         } catch (Exception e) {
             Msg.error(this, "Error renaming function by address", e);
@@ -1322,30 +1496,31 @@ public class GhidraMCPPlugin extends Plugin {
         if (functionName == null || functionName.isEmpty()) return "Function name is required";
 
         try {
+            Function function = findFunctionByName(program, functionName);
+            if (function == null) {
+                return "No references found to function: " + functionName;
+            }
+
             List<String> refs = new ArrayList<>();
             FunctionManager funcManager = program.getFunctionManager();
-            for (Function function : funcManager.getFunctions(true)) {
-                if (function.getName().equals(functionName)) {
-                    Address entryPoint = function.getEntryPoint();
-                    ReferenceIterator refIter = program.getReferenceManager().getReferencesTo(entryPoint);
-                    
-                    while (refIter.hasNext()) {
-                        Reference ref = refIter.next();
-                        Address fromAddr = ref.getFromAddress();
-                        RefType refType = ref.getReferenceType();
-                        
-                        Function fromFunc = funcManager.getFunctionContaining(fromAddr);
-                        String funcInfo = (fromFunc != null) ? " in " + fromFunc.getName() : "";
-                        
-                        refs.add(String.format("From %s%s [%s]", fromAddr, funcInfo, refType.getName()));
-                    }
-                }
+            Address entryPoint = function.getEntryPoint();
+            ReferenceIterator refIter = program.getReferenceManager().getReferencesTo(entryPoint);
+
+            while (refIter.hasNext()) {
+                Reference ref = refIter.next();
+                Address fromAddr = ref.getFromAddress();
+                RefType refType = ref.getReferenceType();
+
+                Function fromFunc = funcManager.getFunctionContaining(fromAddr);
+                String funcInfo = (fromFunc != null) ? " in " + getFullyQualifiedFunctionName(fromFunc) : "";
+
+                refs.add(String.format("From %s%s [%s]", fromAddr, funcInfo, refType.getName()));
             }
-            
+
             if (refs.isEmpty()) {
                 return "No references found to function: " + functionName;
             }
-            
+
             return paginateList(refs, offset, limit);
         } catch (Exception e) {
             return "Error getting function references: " + e.getMessage();
@@ -1425,6 +1600,20 @@ public class GhidraMCPPlugin extends Plugin {
         if (dataType != null) {
             Msg.info(this, "Found exact data type match: " + dataType.getPathName());
             return dataType;
+        }
+
+        // Check for C-style pointer types (type*)
+        if (typeName.endsWith("*")) {
+            String baseTypeName = typeName.substring(0, typeName.length() - 1).trim();
+            if (baseTypeName.isEmpty()) {
+                return new PointerDataType(dtm.getDataType("/void"));
+            }
+            DataType baseType = resolveDataType(dtm, baseTypeName);
+            if (baseType != null) {
+                return new PointerDataType(baseType);
+            }
+            Msg.warn(this, "Base type not found for pointer: " + typeName + ", defaulting to void*");
+            return new PointerDataType(dtm.getDataType("/void"));
         }
 
         // Check for Windows-style pointer types (PXXX)
@@ -1527,6 +1716,996 @@ public class GhidraMCPPlugin extends Plugin {
         return null;
     }
 
+    /**
+     * Find a Structure data type by name in all categories.
+     */
+    private Structure findStructureByName(DataTypeManager dtm, String name) {
+        DataType dt = findDataTypeByNameInAllCategories(dtm, name);
+        if (dt instanceof Structure) {
+            return (Structure) dt;
+        }
+        return null;
+    }
+
+    /**
+     * Find a Union data type by name in all categories.
+     */
+    private Union findUnionByName(DataTypeManager dtm, String name) {
+        DataType dt = findDataTypeByNameInAllCategories(dtm, name);
+        if (dt instanceof Union) {
+            return (Union) dt;
+        }
+        return null;
+    }
+
+    /**
+     * Find an Enum data type by name in all categories.
+     */
+    private ghidra.program.model.data.Enum findEnumByName(DataTypeManager dtm, String name) {
+        DataType dt = findDataTypeByNameInAllCategories(dtm, name);
+        if (dt instanceof ghidra.program.model.data.Enum) {
+            return (ghidra.program.model.data.Enum) dt;
+        }
+        return null;
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Namespace management endpoints
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Create a namespace hierarchy from a :: delimited path.
+     */
+    private String createNamespace(String namespacePath) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (namespacePath == null || namespacePath.isEmpty()) return "Namespace path is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create namespace");
+                boolean success = false;
+                try {
+                    Namespace ns = NamespaceUtils.createNamespaceHierarchy(
+                        namespacePath, null, program, SourceType.USER_DEFINED);
+                    result.append("Created namespace: ").append(ns.getName(true));
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error creating namespace: ").append(e.getMessage());
+                    Msg.error(this, "Error creating namespace", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to create namespace on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Move the primary symbol at a given address into a namespace.
+     */
+    private String moveSymbolToNamespace(String addressStr, String namespacePath) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (namespacePath == null || namespacePath.isEmpty()) return "Namespace path is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Move symbol to namespace");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    Symbol symbol = program.getSymbolTable().getPrimarySymbol(addr);
+                    if (symbol == null) {
+                        result.append("No symbol found at address: ").append(addressStr);
+                        return;
+                    }
+                    Namespace targetNs = NamespaceUtils.createNamespaceHierarchy(
+                        namespacePath, null, program, SourceType.USER_DEFINED);
+                    symbol.setNamespace(targetNs);
+                    result.append("Moved ").append(symbol.getName())
+                          .append(" to ").append(targetNs.getName(true));
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error moving symbol: ").append(e.getMessage());
+                    Msg.error(this, "Error moving symbol to namespace", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to move symbol on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * List the contents (symbols) of a namespace.
+     */
+    private String listNamespaceContents(String namespacePath, int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (namespacePath == null || namespacePath.isEmpty()) return "Namespace path is required";
+
+        List<Namespace> nsList = NamespaceUtils.getNamespaceByPath(program, null, namespacePath);
+        if (nsList == null || nsList.isEmpty()) {
+            return "Namespace not found: " + namespacePath;
+        }
+        Namespace ns = nsList.get(0);
+
+        List<String> lines = new ArrayList<>();
+        SymbolIterator symIter = program.getSymbolTable().getSymbols(ns);
+        while (symIter.hasNext()) {
+            Symbol sym = symIter.next();
+            lines.add(String.format("%s [%s] @ %s",
+                sym.getName(), sym.getSymbolType().toString(), sym.getAddress()));
+        }
+
+        if (lines.isEmpty()) {
+            return "Namespace is empty: " + namespacePath;
+        }
+        return paginateList(lines, offset, limit);
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Data structure management methods
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Create a new structure data type.
+     */
+    private String createStruct(String name, int size, String categoryPath) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (name == null || name.isEmpty()) return "Structure name is required";
+        if (size <= 0) return "Structure size must be a positive integer";
+
+        if (categoryPath == null || categoryPath.isEmpty()) {
+            categoryPath = "/";
+        }
+        final String catPath = categoryPath;
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Create struct: " + name);
+                boolean success = false;
+                try {
+                    StructureDataType struct = new StructureDataType(new CategoryPath(catPath), name, size, dtm);
+                    dtm.addDataType(struct, DataTypeConflictHandler.DEFAULT_HANDLER);
+                    result.append("Created structure: ").append(name).append(" (").append(size).append(" bytes)");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error creating structure: ").append(e.getMessage());
+                    Msg.error(this, "Error creating structure", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to create structure on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Add or replace a field at a specific offset in a structure.
+     */
+    private String addStructField(String structName, int offset, String fieldType, String fieldName, int fieldLength, String comment) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (structName == null || structName.isEmpty()) return "Structure name is required";
+        if (offset < 0) return "Field offset is required and must be non-negative";
+        if (fieldType == null || fieldType.isEmpty()) return "Field type is required";
+        if (fieldName == null || fieldName.isEmpty()) return "Field name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Add struct field: " + fieldName);
+                boolean success = false;
+                try {
+                    Structure struct = findStructureByName(dtm, structName);
+                    if (struct == null) {
+                        result.append("Structure not found: ").append(structName);
+                        return;
+                    }
+                    DataType dataType = resolveDataType(dtm, fieldType);
+                    if (dataType == null) {
+                        result.append("Could not resolve field type: ").append(fieldType);
+                        return;
+                    }
+                    int length = fieldLength > 0 ? fieldLength : dataType.getLength();
+                    struct.replaceAtOffset(offset, dataType, length, fieldName, comment);
+                    result.append("Added field '").append(fieldName).append("' at offset ").append(offset)
+                          .append(" in struct '").append(structName).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error adding struct field: ").append(e.getMessage());
+                    Msg.error(this, "Error adding struct field", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to add struct field on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Delete (clear) a field at a specific offset in a structure.
+     */
+    private String deleteStructField(String structName, int offset) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (structName == null || structName.isEmpty()) return "Structure name is required";
+        if (offset < 0) return "Field offset is required and must be non-negative";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Delete struct field at offset " + offset);
+                boolean success = false;
+                try {
+                    Structure struct = findStructureByName(dtm, structName);
+                    if (struct == null) {
+                        result.append("Structure not found: ").append(structName);
+                        return;
+                    }
+                    struct.clearAtOffset(offset);
+                    result.append("Cleared field at offset ").append(offset)
+                          .append(" in struct '").append(structName).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error deleting struct field: ").append(e.getMessage());
+                    Msg.error(this, "Error deleting struct field", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to delete struct field on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Get all defined fields of a structure.
+     */
+    private String getStructFields(String structName, int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (structName == null || structName.isEmpty()) return "Structure name is required";
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        Structure struct = findStructureByName(dtm, structName);
+        if (struct == null) return "Structure not found: " + structName;
+
+        DataTypeComponent[] components = struct.getDefinedComponents();
+        List<String> lines = new ArrayList<>();
+        for (DataTypeComponent comp : components) {
+            String fieldName = comp.getFieldName() != null ? comp.getFieldName() : "(unnamed)";
+            String comment = comp.getComment() != null ? comp.getComment() : "";
+            lines.add(String.format("Offset: %d, Type: %s, Name: %s, Length: %d, Comment: %s",
+                comp.getOffset(), comp.getDataType().getName(), fieldName, comp.getLength(), comment));
+        }
+
+        if (lines.isEmpty()) {
+            return "Structure '" + structName + "' has no defined fields (size: " + struct.getLength() + " bytes)";
+        }
+        return paginateList(lines, offset, limit);
+    }
+
+    /**
+     * Create a new union data type.
+     */
+    private String createUnion(String name, String categoryPath) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (name == null || name.isEmpty()) return "Union name is required";
+
+        if (categoryPath == null || categoryPath.isEmpty()) {
+            categoryPath = "/";
+        }
+        final String catPath = categoryPath;
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Create union: " + name);
+                boolean success = false;
+                try {
+                    UnionDataType union = new UnionDataType(new CategoryPath(catPath), name, dtm);
+                    dtm.addDataType(union, DataTypeConflictHandler.DEFAULT_HANDLER);
+                    result.append("Created union: ").append(name);
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error creating union: ").append(e.getMessage());
+                    Msg.error(this, "Error creating union", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to create union on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Add a field to a union data type.
+     */
+    private String addUnionField(String unionName, String fieldType, String fieldName, int fieldLength, String comment) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (unionName == null || unionName.isEmpty()) return "Union name is required";
+        if (fieldType == null || fieldType.isEmpty()) return "Field type is required";
+        if (fieldName == null || fieldName.isEmpty()) return "Field name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Add union field: " + fieldName);
+                boolean success = false;
+                try {
+                    Union union = findUnionByName(dtm, unionName);
+                    if (union == null) {
+                        result.append("Union not found: ").append(unionName);
+                        return;
+                    }
+                    DataType dataType = resolveDataType(dtm, fieldType);
+                    if (dataType == null) {
+                        result.append("Could not resolve field type: ").append(fieldType);
+                        return;
+                    }
+                    int length = fieldLength > 0 ? fieldLength : dataType.getLength();
+                    union.add(dataType, length, fieldName, comment);
+                    result.append("Added field '").append(fieldName).append("' to union '").append(unionName).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error adding union field: ").append(e.getMessage());
+                    Msg.error(this, "Error adding union field", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to add union field on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Create a new enum data type.
+     */
+    private String createEnum(String name, int size, String categoryPath) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (name == null || name.isEmpty()) return "Enum name is required";
+        if (size != 1 && size != 2 && size != 4 && size != 8) return "Enum size must be 1, 2, 4, or 8 bytes";
+
+        if (categoryPath == null || categoryPath.isEmpty()) {
+            categoryPath = "/";
+        }
+        final String catPath = categoryPath;
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Create enum: " + name);
+                boolean success = false;
+                try {
+                    EnumDataType enumDt = new EnumDataType(new CategoryPath(catPath), name, size, dtm);
+                    dtm.addDataType(enumDt, DataTypeConflictHandler.DEFAULT_HANDLER);
+                    result.append("Created enum: ").append(name).append(" (").append(size).append(" bytes)");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error creating enum: ").append(e.getMessage());
+                    Msg.error(this, "Error creating enum", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to create enum on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Add a named value to an enum data type.
+     */
+    private String addEnumValue(String enumName, String entryName, long value) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (enumName == null || enumName.isEmpty()) return "Enum name is required";
+        if (entryName == null || entryName.isEmpty()) return "Entry name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Add enum value: " + entryName);
+                boolean success = false;
+                try {
+                    ghidra.program.model.data.Enum enumDt = findEnumByName(dtm, enumName);
+                    if (enumDt == null) {
+                        result.append("Enum not found: ").append(enumName);
+                        return;
+                    }
+                    enumDt.add(entryName, value);
+                    result.append("Added value '").append(entryName).append("' = ").append(value)
+                          .append(" to enum '").append(enumName).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error adding enum value: ").append(e.getMessage());
+                    Msg.error(this, "Error adding enum value", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to add enum value on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Get detailed information about a data type by name.
+     */
+    private String getDataTypeInfo(String name) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (name == null || name.isEmpty()) return "Data type name is required";
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        DataType dt = findDataTypeByNameInAllCategories(dtm, name);
+        if (dt == null) return "Data type not found: " + name;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Name: ").append(dt.getName()).append("\n");
+        sb.append("Category: ").append(dt.getCategoryPath()).append("\n");
+        sb.append("Length: ").append(dt.getLength()).append(" bytes\n");
+
+        if (dt instanceof Structure) {
+            Structure struct = (Structure) dt;
+            sb.append("Type: Structure\n");
+            sb.append("Alignment: ").append(struct.getAlignment()).append("\n");
+            DataTypeComponent[] components = struct.getDefinedComponents();
+            sb.append("Fields (").append(components.length).append("):\n");
+            for (DataTypeComponent comp : components) {
+                String fieldName = comp.getFieldName() != null ? comp.getFieldName() : "(unnamed)";
+                String comment = comp.getComment() != null ? comp.getComment() : "";
+                sb.append(String.format("  Offset: %d, Type: %s, Name: %s, Length: %d, Comment: %s\n",
+                    comp.getOffset(), comp.getDataType().getName(), fieldName, comp.getLength(), comment));
+            }
+        } else if (dt instanceof Union) {
+            Union union = (Union) dt;
+            sb.append("Type: Union\n");
+            DataTypeComponent[] components = union.getDefinedComponents();
+            sb.append("Fields (").append(components.length).append("):\n");
+            for (int i = 0; i < components.length; i++) {
+                DataTypeComponent comp = components[i];
+                String fieldName = comp.getFieldName() != null ? comp.getFieldName() : "(unnamed)";
+                String comment = comp.getComment() != null ? comp.getComment() : "";
+                sb.append(String.format("  Ordinal: %d, Type: %s, Name: %s, Length: %d, Comment: %s\n",
+                    comp.getOrdinal(), comp.getDataType().getName(), fieldName, comp.getLength(), comment));
+            }
+        } else if (dt instanceof ghidra.program.model.data.Enum) {
+            ghidra.program.model.data.Enum enumDt = (ghidra.program.model.data.Enum) dt;
+            sb.append("Type: Enum\n");
+            String[] names = enumDt.getNames();
+            sb.append("Values (").append(names.length).append("):\n");
+            for (String n : names) {
+                sb.append(String.format("  %s = %d\n", n, enumDt.getValue(n)));
+            }
+        } else {
+            sb.append("Type: ").append(dt.getClass().getSimpleName()).append("\n");
+            if (dt.getDescription() != null && !dt.getDescription().isEmpty()) {
+                sb.append("Description: ").append(dt.getDescription()).append("\n");
+            }
+        }
+
+        return sb.toString().stripTrailing();
+    }
+
+    /**
+     * Apply a structure data type at a specific address.
+     */
+    private String applyStructToAddress(String addressStr, String structName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (structName == null || structName.isEmpty()) return "Structure name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Apply struct at address");
+                boolean success = false;
+                try {
+                    Structure struct = findStructureByName(dtm, structName);
+                    if (struct == null) {
+                        result.append("Structure not found: ").append(structName);
+                        return;
+                    }
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    if (addr == null) {
+                        result.append("Invalid address: ").append(addressStr);
+                        return;
+                    }
+                    program.getListing().clearCodeUnits(addr, addr.add(struct.getLength() - 1), false);
+                    program.getListing().createData(addr, struct);
+                    result.append("Applied struct '").append(structName).append("' at address ").append(addressStr);
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error applying struct: ").append(e.getMessage());
+                    Msg.error(this, "Error applying struct to address", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to apply struct on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Function signature refactoring methods
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Get detailed signature information for a function at the given address.
+     */
+    private String getFunctionSignatureDetails(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            if (addr == null) return "Invalid address: " + addressStr;
+
+            Function func = program.getFunctionManager().getFunctionAt(addr);
+            if (func == null) return "No function found at address " + addressStr;
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("Prototype: ").append(func.getSignature().getPrototypeString()).append("\n");
+            sb.append("Return Type: ").append(func.getReturnType().getName()).append("\n");
+            sb.append("Calling Convention: ").append(func.getCallingConventionName()).append("\n");
+            sb.append("Parameter Count: ").append(func.getParameterCount()).append("\n");
+
+            Parameter[] params = func.getParameters();
+            for (int i = 0; i < params.length; i++) {
+                Parameter p = params[i];
+                sb.append("Param ").append(i).append(": ")
+                  .append(p.getDataType().getName()).append(" ")
+                  .append(p.getName())
+                  .append(" (ordinal=").append(p.getOrdinal())
+                  .append(", storage=").append(p.getVariableStorage())
+                  .append(")\n");
+            }
+
+            return sb.toString().stripTrailing();
+        } catch (Exception e) {
+            return "Error getting function signature: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Set the return type of a function at the given address.
+     */
+    private String setFunctionReturnType(String addressStr, String returnTypeName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Function address is required";
+        if (returnTypeName == null || returnTypeName.isEmpty()) return "Return type is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Set return type");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    if (addr == null) {
+                        result.append("Invalid address: ").append(addressStr);
+                        return;
+                    }
+                    Function func = program.getFunctionManager().getFunctionAt(addr);
+                    if (func == null) {
+                        result.append("No function found at address ").append(addressStr);
+                        return;
+                    }
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dataType = resolveDataType(dtm, returnTypeName);
+                    if (dataType == null) {
+                        result.append("Could not resolve return type: ").append(returnTypeName);
+                        return;
+                    }
+                    func.setReturnType(dataType, SourceType.USER_DEFINED);
+                    result.append("Set return type of '").append(func.getName())
+                          .append("' to '").append(returnTypeName).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error setting return type: ").append(e.getMessage());
+                    Msg.error(this, "Error setting return type", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to set return type on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Add a parameter to a function at the given address.
+     */
+    private String addFunctionParameter(String addressStr, String paramName, String paramType, int index) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Function address is required";
+        if (paramName == null || paramName.isEmpty()) return "Parameter name is required";
+        if (paramType == null || paramType.isEmpty()) return "Parameter type is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Add parameter");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    if (addr == null) {
+                        result.append("Invalid address: ").append(addressStr);
+                        return;
+                    }
+                    Function func = program.getFunctionManager().getFunctionAt(addr);
+                    if (func == null) {
+                        result.append("No function found at address ").append(addressStr);
+                        return;
+                    }
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dataType = resolveDataType(dtm, paramType);
+                    if (dataType == null) {
+                        result.append("Could not resolve parameter type: ").append(paramType);
+                        return;
+                    }
+                    ParameterImpl param = new ParameterImpl(paramName, dataType, program);
+                    if (index >= 0) {
+                        func.insertParameter(index, param, SourceType.USER_DEFINED);
+                    } else {
+                        func.addParameter(param, SourceType.USER_DEFINED);
+                    }
+                    result.append("Added parameter '").append(paramName)
+                          .append("' of type '").append(paramType)
+                          .append("' to '").append(func.getName()).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error adding parameter: ").append(e.getMessage());
+                    Msg.error(this, "Error adding parameter", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to add parameter on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Remove a parameter from a function at the given address by index.
+     */
+    private String removeFunctionParameter(String addressStr, int index) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Function address is required";
+        if (index < 0) return "Parameter index is required and must be non-negative";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Remove parameter");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    if (addr == null) {
+                        result.append("Invalid address: ").append(addressStr);
+                        return;
+                    }
+                    Function func = program.getFunctionManager().getFunctionAt(addr);
+                    if (func == null) {
+                        result.append("No function found at address ").append(addressStr);
+                        return;
+                    }
+                    if (index >= func.getParameterCount()) {
+                        result.append("Parameter index ").append(index)
+                              .append(" out of range (function has ").append(func.getParameterCount())
+                              .append(" parameters)");
+                        return;
+                    }
+                    func.removeParameter(index);
+                    result.append("Removed parameter at index ").append(index)
+                          .append(" from '").append(func.getName()).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error removing parameter: ").append(e.getMessage());
+                    Msg.error(this, "Error removing parameter", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to remove parameter on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Change the data type of a function parameter at the given index.
+     */
+    private String changeFunctionParameterType(String addressStr, int index, String newTypeName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Function address is required";
+        if (index < 0) return "Parameter index is required and must be non-negative";
+        if (newTypeName == null || newTypeName.isEmpty()) return "New type name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Change parameter type");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    if (addr == null) {
+                        result.append("Invalid address: ").append(addressStr);
+                        return;
+                    }
+                    Function func = program.getFunctionManager().getFunctionAt(addr);
+                    if (func == null) {
+                        result.append("No function found at address ").append(addressStr);
+                        return;
+                    }
+                    if (index >= func.getParameterCount()) {
+                        result.append("Parameter index ").append(index)
+                              .append(" out of range (function has ").append(func.getParameterCount())
+                              .append(" parameters)");
+                        return;
+                    }
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dataType = resolveDataType(dtm, newTypeName);
+                    if (dataType == null) {
+                        result.append("Could not resolve type: ").append(newTypeName);
+                        return;
+                    }
+                    func.getParameter(index).setDataType(dataType, SourceType.USER_DEFINED);
+                    result.append("Changed type of parameter ").append(index)
+                          .append(" to '").append(newTypeName)
+                          .append("' in '").append(func.getName()).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error changing parameter type: ").append(e.getMessage());
+                    Msg.error(this, "Error changing parameter type", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to change parameter type on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Rename a function parameter at the given index.
+     */
+    private String renameFunctionParameter(String addressStr, int index, String newName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Function address is required";
+        if (index < 0) return "Parameter index is required and must be non-negative";
+        if (newName == null || newName.isEmpty()) return "New parameter name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Rename parameter");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    if (addr == null) {
+                        result.append("Invalid address: ").append(addressStr);
+                        return;
+                    }
+                    Function func = program.getFunctionManager().getFunctionAt(addr);
+                    if (func == null) {
+                        result.append("No function found at address ").append(addressStr);
+                        return;
+                    }
+                    if (index >= func.getParameterCount()) {
+                        result.append("Parameter index ").append(index)
+                              .append(" out of range (function has ").append(func.getParameterCount())
+                              .append(" parameters)");
+                        return;
+                    }
+                    func.getParameter(index).setName(newName, SourceType.USER_DEFINED);
+                    result.append("Renamed parameter ").append(index)
+                          .append(" to '").append(newName)
+                          .append("' in '").append(func.getName()).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error renaming parameter: ").append(e.getMessage());
+                    Msg.error(this, "Error renaming parameter", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to rename parameter on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Set the calling convention of a function at the given address.
+     */
+    private String setFunctionCallingConvention(String addressStr, String convention) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Function address is required";
+        if (convention == null || convention.isEmpty()) return "Calling convention is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Set calling convention");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    if (addr == null) {
+                        result.append("Invalid address: ").append(addressStr);
+                        return;
+                    }
+                    Function func = program.getFunctionManager().getFunctionAt(addr);
+                    if (func == null) {
+                        result.append("No function found at address ").append(addressStr);
+                        return;
+                    }
+                    func.setCallingConvention(convention);
+                    result.append("Set calling convention of '").append(func.getName())
+                          .append("' to '").append(convention).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error setting calling convention: ").append(e.getMessage());
+                    Msg.error(this, "Error setting calling convention", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to set calling convention on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Namespace utilities
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Simple holder for a resolved namespace + simple name pair.
+     */
+    private static class NamespacedName {
+        final Namespace namespace;
+        final String simpleName;
+
+        NamespacedName(Namespace namespace, String simpleName) {
+            this.namespace = namespace;
+            this.simpleName = simpleName;
+        }
+    }
+
+    /**
+     * Find the index of the last "::" delimiter that is NOT inside angle brackets.
+     * This correctly handles C++ template/generic names like:
+     *   "jag::script::push_stack<jag::engine::Tile>"
+     *   "std::vector<std::pair<int, int>>"
+     *   "ns::Foo<ns::Bar<ns::Baz>>"
+     *
+     * Scans left-to-right tracking angle bracket depth (<> nesting).
+     * Records the position of each "::" found at depth 0. Returns the
+     * last such position, or -1 if no "::" exists outside brackets.
+     */
+    private int lastDelimiterOutsideBrackets(String name) {
+        int lastPos = -1;
+        int depth = 0;
+
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c == '<') {
+                depth++;
+            } else if (c == '>') {
+                if (depth > 0) {
+                    depth--;
+                }
+            } else if (depth == 0 && c == ':' && i + 1 < name.length() && name.charAt(i + 1) == ':') {
+                lastPos = i;
+                i++; // skip the second ':'
+            }
+        }
+        return lastPos;
+    }
+
+    /**
+     * If qualifiedName contains "::" outside of angle brackets, splits it into
+     * namespace path and simple name, creates/gets the namespace hierarchy,
+     * and returns a NamespacedName.
+     * Returns null if no "::" is present outside angle brackets (caller should
+     * use legacy path).
+     */
+    private NamespacedName resolveNamespacedName(Program program, String qualifiedName)
+            throws InvalidInputException, DuplicateNameException {
+        int lastDelim = lastDelimiterOutsideBrackets(qualifiedName);
+        if (lastDelim < 0) {
+            return null;
+        }
+        String namespacePath = qualifiedName.substring(0, lastDelim);
+        String simpleName = qualifiedName.substring(lastDelim + Namespace.DELIMITER.length());
+
+        Namespace targetNs = NamespaceUtils.createNamespaceHierarchy(
+            namespacePath, null, program, SourceType.USER_DEFINED);
+        return new NamespacedName(targetNs, simpleName);
+    }
+
+    /**
+     * Find a function by name. If the name contains "::" outside angle brackets,
+     * uses NamespaceUtils.getSymbols() to look up by qualified name.
+     * Otherwise falls back to iterating all functions by simple name.
+     * This correctly handles C++ template names where "::" may appear inside
+     * angle brackets (e.g. "push_stack<jag::engine::Tile>").
+     */
+    private Function findFunctionByName(Program program, String name) {
+        if (lastDelimiterOutsideBrackets(name) >= 0) {
+            List<Symbol> symbols = NamespaceUtils.getSymbols(name, program);
+            for (Symbol sym : symbols) {
+                if (sym.getSymbolType() == SymbolType.FUNCTION) {
+                    return program.getFunctionManager().getFunctionAt(sym.getAddress());
+                }
+            }
+            return null;
+        }
+        for (Function f : program.getFunctionManager().getFunctions(true)) {
+            if (f.getName().equals(name)) {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the fully-qualified name of a function including its namespace path.
+     */
+    private String getFullyQualifiedFunctionName(Function func) {
+        return func.getSymbol().getName(true);
+    }
+
     // ----------------------------------------------------------------------------------
     // Utility: parse query params, parse post params, pagination, etc.
     // ----------------------------------------------------------------------------------
@@ -1602,6 +2781,22 @@ public class GhidraMCPPlugin extends Plugin {
             return Integer.parseInt(val);
         }
         catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    /**
+     * Parse a long from a string, or return defaultValue if null/invalid.
+     * Supports 0x hex prefix.
+     */
+    private long parseLongOrDefault(String val, long defaultValue) {
+        if (val == null) return defaultValue;
+        try {
+            if (val.startsWith("0x") || val.startsWith("0X")) {
+                return Long.parseLong(val.substring(2), 16);
+            }
+            return Long.parseLong(val);
+        } catch (NumberFormatException e) {
             return defaultValue;
         }
     }
