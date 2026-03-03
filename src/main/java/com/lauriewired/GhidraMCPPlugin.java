@@ -63,6 +63,7 @@ import javax.swing.SwingUtilities;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -82,6 +83,8 @@ public class GhidraMCPPlugin extends Plugin {
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
     private static final int DEFAULT_PORT = 8080;
+    private int actualPort;
+    private static final int MAX_PORT_RETRIES = 10;
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -91,7 +94,8 @@ public class GhidraMCPPlugin extends Plugin {
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
         options.registerOption(PORT_OPTION_NAME, DEFAULT_PORT,
             null, // No help location for now
-            "The network port number the embedded HTTP server will listen on. " +
+            "The base port number the embedded HTTP server will listen on. " +
+            "If the port is in use, the server will auto-increment up to 10 ports. " +
             "Requires Ghidra restart or plugin reload to take effect after changing.");
 
         try {
@@ -115,7 +119,27 @@ public class GhidraMCPPlugin extends Plugin {
             server = null;
         }
 
-        server = HttpServer.create(new InetSocketAddress(port), 0);
+        // Try to bind to the configured port, auto-incrementing on failure
+        IOException lastException = null;
+        for (int attempt = 0; attempt < MAX_PORT_RETRIES; attempt++) {
+            int tryPort = port + attempt;
+            try {
+                server = HttpServer.create(new InetSocketAddress(tryPort), 0);
+                actualPort = tryPort;
+                if (attempt > 0) {
+                    Msg.info(this, "Port " + port + " was in use; bound to port " + actualPort + " instead.");
+                }
+                lastException = null;
+                break;
+            } catch (BindException e) {
+                Msg.warn(this, "Port " + tryPort + " is in use, trying next port...");
+                lastException = e;
+                server = null;
+            }
+        }
+        if (lastException != null) {
+            throw new IOException("Could not bind to any port in range " + port + "-" + (port + MAX_PORT_RETRIES - 1), lastException);
+        }
 
         // Each listing endpoint uses offset & limit from query params:
         server.createContext("/methods", exchange -> {
@@ -550,13 +574,36 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, setFunctionCallingConvention(functionAddress, convention));
         });
 
+        server.createContext("/info", exchange -> {
+            StringBuilder sb = new StringBuilder();
+            sb.append("status=ok\n");
+            sb.append("port=").append(actualPort).append("\n");
+            Program program = getCurrentProgram();
+            if (program != null) {
+                sb.append("program_name=").append(program.getName()).append("\n");
+                sb.append("program_path=").append(program.getExecutablePath()).append("\n");
+                sb.append("language=").append(program.getLanguageID()).append("\n");
+                sb.append("compiler=").append(program.getCompilerSpec().getCompilerSpecID()).append("\n");
+            } else {
+                sb.append("program_name=\n");
+                sb.append("program_path=\n");
+                sb.append("language=\n");
+                sb.append("compiler=\n");
+            }
+            sendResponse(exchange, sb.toString());
+        });
+
+        server.createContext("/ping", exchange -> {
+            sendResponse(exchange, "pong");
+        });
+
         server.setExecutor(null);
         new Thread(() -> {
             try {
                 server.start();
-                Msg.info(this, "GhidraMCP HTTP server started on port " + port);
+                Msg.info(this, "GhidraMCP HTTP server started on port " + actualPort);
             } catch (Exception e) {
-                Msg.error(this, "Failed to start HTTP server on port " + port + ". Port might be in use.", e);
+                Msg.error(this, "Failed to start HTTP server on port " + actualPort, e);
                 server = null; // Ensure server isn't considered running
             }
         }, "GhidraMCP-HTTP-Server").start();
