@@ -54,6 +54,7 @@ import ghidra.program.model.data.DataTypeConflictHandler;
 import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.Union;
 import ghidra.program.model.data.Composite;
+import ghidra.program.model.data.TypedefDataType;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -62,6 +63,7 @@ import javax.swing.SwingUtilities;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -81,6 +83,8 @@ public class GhidraMCPPlugin extends Plugin {
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
     private static final int DEFAULT_PORT = 8080;
+    private int actualPort;
+    private static final int MAX_PORT_RETRIES = 10;
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -90,7 +94,8 @@ public class GhidraMCPPlugin extends Plugin {
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
         options.registerOption(PORT_OPTION_NAME, DEFAULT_PORT,
             null, // No help location for now
-            "The network port number the embedded HTTP server will listen on. " +
+            "The base port number the embedded HTTP server will listen on. " +
+            "If the port is in use, the server will auto-increment up to 10 ports. " +
             "Requires Ghidra restart or plugin reload to take effect after changing.");
 
         try {
@@ -114,7 +119,27 @@ public class GhidraMCPPlugin extends Plugin {
             server = null;
         }
 
-        server = HttpServer.create(new InetSocketAddress(port), 0);
+        // Try to bind to the configured port, auto-incrementing on failure
+        IOException lastException = null;
+        for (int attempt = 0; attempt < MAX_PORT_RETRIES; attempt++) {
+            int tryPort = port + attempt;
+            try {
+                server = HttpServer.create(new InetSocketAddress(tryPort), 0);
+                actualPort = tryPort;
+                if (attempt > 0) {
+                    Msg.info(this, "Port " + port + " was in use; bound to port " + actualPort + " instead.");
+                }
+                lastException = null;
+                break;
+            } catch (BindException e) {
+                Msg.warn(this, "Port " + tryPort + " is in use, trying next port...");
+                lastException = e;
+                server = null;
+            }
+        }
+        if (lastException != null) {
+            throw new IOException("Could not bind to any port in range " + port + "-" + (port + MAX_PORT_RETRIES - 1), lastException);
+        }
 
         // Each listing endpoint uses offset & limit from query params:
         server.createContext("/methods", exchange -> {
@@ -453,6 +478,49 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, applyStructToAddress(address, structName));
         });
 
+        server.createContext("/deleteDataType", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            sendResponse(exchange, deleteDataType(name));
+        });
+
+        server.createContext("/renameDataType", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String oldName = params.get("old_name");
+            String newName = params.get("new_name");
+            sendResponse(exchange, renameDataType(oldName, newName));
+        });
+
+        server.createContext("/listDataTypes", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String categoryFilter = qparams.get("category_filter");
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, listDataTypes(categoryFilter, offset, limit));
+        });
+
+        server.createContext("/deleteUnionField", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String unionName = params.get("union_name");
+            int ordinal = parseIntOrDefault(params.get("ordinal"), -1);
+            sendResponse(exchange, deleteUnionField(unionName, ordinal));
+        });
+
+        server.createContext("/deleteEnumValue", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String enumName = params.get("enum_name");
+            String entryName = params.get("entry_name");
+            sendResponse(exchange, deleteEnumValue(enumName, entryName));
+        });
+
+        server.createContext("/createTypedef", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            String baseType = params.get("base_type");
+            String categoryPath = params.get("category_path");
+            sendResponse(exchange, createTypedef(name, baseType, categoryPath));
+        });
+
         // Function signature refactoring endpoints
         server.createContext("/getFunctionSignature", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
@@ -506,13 +574,36 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, setFunctionCallingConvention(functionAddress, convention));
         });
 
+        server.createContext("/info", exchange -> {
+            StringBuilder sb = new StringBuilder();
+            sb.append("status=ok\n");
+            sb.append("port=").append(actualPort).append("\n");
+            Program program = getCurrentProgram();
+            if (program != null) {
+                sb.append("program_name=").append(program.getName()).append("\n");
+                sb.append("program_path=").append(program.getExecutablePath()).append("\n");
+                sb.append("language=").append(program.getLanguageID()).append("\n");
+                sb.append("compiler=").append(program.getCompilerSpec().getCompilerSpecID()).append("\n");
+            } else {
+                sb.append("program_name=\n");
+                sb.append("program_path=\n");
+                sb.append("language=\n");
+                sb.append("compiler=\n");
+            }
+            sendResponse(exchange, sb.toString());
+        });
+
+        server.createContext("/ping", exchange -> {
+            sendResponse(exchange, "pong");
+        });
+
         server.setExecutor(null);
         new Thread(() -> {
             try {
                 server.start();
-                Msg.info(this, "GhidraMCP HTTP server started on port " + port);
+                Msg.info(this, "GhidraMCP HTTP server started on port " + actualPort);
             } catch (Exception e) {
-                Msg.error(this, "Failed to start HTTP server on port " + port + ". Port might be in use.", e);
+                Msg.error(this, "Failed to start HTTP server on port " + actualPort, e);
                 server = null; // Ensure server isn't considered running
             }
         }, "GhidraMCP-HTTP-Server").start();
@@ -2260,6 +2351,265 @@ public class GhidraMCPPlugin extends Plugin {
             });
         } catch (InterruptedException | InvocationTargetException e) {
             return "Failed to apply struct on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Delete any data type by name.
+     */
+    private String deleteDataType(String name) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (name == null || name.isEmpty()) return "Data type name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Delete data type: " + name);
+                boolean success = false;
+                try {
+                    DataType dt = findDataTypeByNameInAllCategories(dtm, name);
+                    if (dt == null) {
+                        result.append("Data type not found: ").append(name);
+                        return;
+                    }
+                    dtm.remove(dt, TaskMonitor.DUMMY);
+                    result.append("Deleted data type: ").append(name);
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error deleting data type: ").append(e.getMessage());
+                    Msg.error(this, "Error deleting data type", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to delete data type on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Rename any data type.
+     */
+    private String renameDataType(String oldName, String newName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (oldName == null || oldName.isEmpty()) return "Old data type name is required";
+        if (newName == null || newName.isEmpty()) return "New data type name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Rename data type: " + oldName + " -> " + newName);
+                boolean success = false;
+                try {
+                    DataType dt = findDataTypeByNameInAllCategories(dtm, oldName);
+                    if (dt == null) {
+                        result.append("Data type not found: ").append(oldName);
+                        return;
+                    }
+                    dt.setName(newName);
+                    result.append("Renamed data type '").append(oldName).append("' to '").append(newName).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error renaming data type: ").append(e.getMessage());
+                    Msg.error(this, "Error renaming data type", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to rename data type on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * List data types with optional category filter and pagination.
+     */
+    private String listDataTypes(String categoryFilter, int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        Iterator<DataType> allTypes = dtm.getAllDataTypes();
+
+        List<String> lines = new ArrayList<>();
+        while (allTypes.hasNext()) {
+            DataType dt = allTypes.next();
+            String categoryPath = dt.getCategoryPath().toString();
+
+            // Apply category filter if provided
+            if (categoryFilter != null && !categoryFilter.isEmpty()) {
+                if (!categoryPath.toLowerCase().contains(categoryFilter.toLowerCase())) {
+                    continue;
+                }
+            }
+
+            // Classify the kind
+            String kind;
+            if (dt instanceof Structure) {
+                kind = "Structure";
+            } else if (dt instanceof Union) {
+                kind = "Union";
+            } else if (dt instanceof ghidra.program.model.data.Enum) {
+                kind = "Enum";
+            } else if (dt instanceof ghidra.program.model.data.TypeDef) {
+                kind = "Typedef";
+            } else if (dt instanceof ghidra.program.model.data.Pointer) {
+                kind = "Pointer";
+            } else if (dt instanceof ghidra.program.model.data.FunctionDefinition) {
+                kind = "FunctionDef";
+            } else {
+                kind = dt.getClass().getSimpleName();
+            }
+
+            int size = dt.getLength();
+            lines.add(String.format("%s [%s] (%d bytes) - %s",
+                dt.getName(), kind, size, categoryPath));
+        }
+
+        if (lines.isEmpty()) {
+            return categoryFilter != null && !categoryFilter.isEmpty()
+                ? "No data types found matching category filter: " + categoryFilter
+                : "No data types found";
+        }
+        return paginateList(lines, offset, limit);
+    }
+
+    /**
+     * Delete a field from a union by ordinal.
+     */
+    private String deleteUnionField(String unionName, int ordinal) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (unionName == null || unionName.isEmpty()) return "Union name is required";
+        if (ordinal < 0) return "Ordinal is required and must be non-negative";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Delete union field at ordinal " + ordinal);
+                boolean success = false;
+                try {
+                    Union union = findUnionByName(dtm, unionName);
+                    if (union == null) {
+                        result.append("Union not found: ").append(unionName);
+                        return;
+                    }
+                    if (ordinal >= union.getNumComponents()) {
+                        result.append("Ordinal ").append(ordinal)
+                              .append(" out of range (union has ").append(union.getNumComponents())
+                              .append(" fields)");
+                        return;
+                    }
+                    union.delete(ordinal);
+                    result.append("Deleted field at ordinal ").append(ordinal)
+                          .append(" from union '").append(unionName).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error deleting union field: ").append(e.getMessage());
+                    Msg.error(this, "Error deleting union field", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to delete union field on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Delete a named constant from an enum.
+     */
+    private String deleteEnumValue(String enumName, String entryName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (enumName == null || enumName.isEmpty()) return "Enum name is required";
+        if (entryName == null || entryName.isEmpty()) return "Entry name is required";
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Delete enum value: " + entryName);
+                boolean success = false;
+                try {
+                    ghidra.program.model.data.Enum enumDt = findEnumByName(dtm, enumName);
+                    if (enumDt == null) {
+                        result.append("Enum not found: ").append(enumName);
+                        return;
+                    }
+                    // Verify the entry exists by trying to get its value
+                    try {
+                        enumDt.getValue(entryName);
+                    } catch (NoSuchElementException e) {
+                        result.append("Entry '").append(entryName)
+                              .append("' not found in enum '").append(enumName).append("'");
+                        return;
+                    }
+                    enumDt.remove(entryName);
+                    result.append("Deleted value '").append(entryName)
+                          .append("' from enum '").append(enumName).append("'");
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error deleting enum value: ").append(e.getMessage());
+                    Msg.error(this, "Error deleting enum value", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to delete enum value on Swing thread: " + e.getMessage();
+        }
+        return result.toString();
+    }
+
+    /**
+     * Create a typedef (type alias) for an existing data type.
+     */
+    private String createTypedef(String name, String baseTypeName, String categoryPath) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (name == null || name.isEmpty()) return "Typedef name is required";
+        if (baseTypeName == null || baseTypeName.isEmpty()) return "Base type is required";
+
+        if (categoryPath == null || categoryPath.isEmpty()) {
+            categoryPath = "/";
+        }
+        final String catPath = categoryPath;
+
+        final StringBuilder result = new StringBuilder();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                DataTypeManager dtm = program.getDataTypeManager();
+                int tx = program.startTransaction("Create typedef: " + name);
+                boolean success = false;
+                try {
+                    DataType baseType = resolveDataType(dtm, baseTypeName);
+                    if (baseType == null) {
+                        result.append("Could not resolve base type: ").append(baseTypeName);
+                        return;
+                    }
+                    TypedefDataType typedef = new TypedefDataType(new CategoryPath(catPath), name, baseType, dtm);
+                    dtm.addDataType(typedef, DataTypeConflictHandler.DEFAULT_HANDLER);
+                    result.append("Created typedef: ").append(name).append(" -> ").append(baseType.getName());
+                    success = true;
+                } catch (Exception e) {
+                    result.append("Error creating typedef: ").append(e.getMessage());
+                    Msg.error(this, "Error creating typedef", e);
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Failed to create typedef on Swing thread: " + e.getMessage();
         }
         return result.toString();
     }

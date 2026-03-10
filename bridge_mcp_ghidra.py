@@ -10,11 +10,14 @@ import sys
 import requests
 import argparse
 import logging
+import threading
+from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
 from mcp.server.fastmcp import FastMCP
 
 DEFAULT_GHIDRA_SERVER = "http://127.0.0.1:8080/"
+HTTP_TIMEOUT = 60
 
 logger = logging.getLogger(__name__)
 
@@ -23,126 +26,510 @@ mcp = FastMCP("ghidra-mcp")
 # Initialize ghidra_server_url with default value
 ghidra_server_url = DEFAULT_GHIDRA_SERVER
 
-def safe_get(endpoint: str, params: dict = None) -> list:
+@dataclass
+class GhidraInstance:
+    port: int
+    base_url: str
+    program_name: str = ""
+    program_path: str = ""
+    language: str = ""
+    compiler: str = ""
+
+
+class GhidraConnectionManager:
+    """Manages connections to multiple Ghidra instances."""
+
+    def __init__(self, base_port: int = 8080, port_range: int = 10):
+        self.base_port = base_port
+        self.port_range = port_range
+        self.instances: dict[int, GhidraInstance] = {}
+        self.active_binary: str | None = None
+        self._lock = threading.Lock()
+
+    def discover(self) -> list[GhidraInstance]:
+        """Scan port range for live Ghidra instances."""
+        found = {}
+        for port in range(self.base_port, self.base_port + self.port_range):
+            try:
+                url = f"http://127.0.0.1:{port}/"
+                resp = requests.get(urljoin(url, "info"), timeout=2)
+                if resp.ok:
+                    info = {}
+                    for line in resp.text.strip().splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            info[k.strip()] = v.strip()
+                    instance = GhidraInstance(
+                        port=port,
+                        base_url=url,
+                        program_name=info.get("program_name", ""),
+                        program_path=info.get("program_path", ""),
+                        language=info.get("language", ""),
+                        compiler=info.get("compiler", ""),
+                    )
+                    found[port] = instance
+            except (requests.ConnectionError, requests.Timeout):
+                continue
+            except Exception as e:
+                logger.debug(f"Error scanning port {port}: {e}")
+                continue
+
+        with self._lock:
+            self.instances = found
+            # Auto-select if only one instance
+            if len(found) == 1:
+                only = next(iter(found.values()))
+                if only.program_name:
+                    self.active_binary = only.program_name
+
+        return list(found.values())
+
+    def get_instance(self, binary_name: str = None) -> GhidraInstance:
+        """Get the target Ghidra instance for a request."""
+        with self._lock:
+            if not self.instances:
+                raise RuntimeError(
+                    "No Ghidra instances found. Make sure Ghidra is running with GhidraMCP plugin, "
+                    "then call discover_ghidra_instances."
+                )
+
+            # If binary_name specified, find it
+            if binary_name:
+                matches = [i for i in self.instances.values() if i.program_name == binary_name]
+                if len(matches) == 1:
+                    return matches[0]
+                elif len(matches) == 0:
+                    available = [i.program_name for i in self.instances.values() if i.program_name]
+                    raise RuntimeError(
+                        f"No instance found with program '{binary_name}'. "
+                        f"Available: {', '.join(available) or 'none'}"
+                    )
+                else:
+                    ports = [str(m.port) for m in matches]
+                    raise RuntimeError(
+                        f"Multiple instances found with program '{binary_name}' on ports {', '.join(ports)}. "
+                        f"This is ambiguous."
+                    )
+
+            # If active binary set, use it
+            if self.active_binary:
+                matches = [i for i in self.instances.values() if i.program_name == self.active_binary]
+                if matches:
+                    return matches[0]
+                # Active binary no longer available, clear it
+                self.active_binary = None
+
+            # If only one instance, use it
+            if len(self.instances) == 1:
+                return next(iter(self.instances.values()))
+
+            # Multiple instances, no selection
+            available = [f"  - {i.program_name} (port {i.port})" for i in self.instances.values()]
+            raise RuntimeError(
+                "Multiple Ghidra instances detected. Specify binary_name or call select_binary first.\n"
+                "Available:\n" + "\n".join(available)
+            )
+
+    def set_active(self, binary_name: str) -> str:
+        """Set the active binary for subsequent tool calls."""
+        with self._lock:
+            matches = [i for i in self.instances.values() if i.program_name == binary_name]
+            if not matches:
+                available = [i.program_name for i in self.instances.values() if i.program_name]
+                raise RuntimeError(
+                    f"No instance found with program '{binary_name}'. "
+                    f"Available: {', '.join(available) or 'none'}. "
+                    f"Try calling discover_ghidra_instances first."
+                )
+            self.active_binary = binary_name
+            return f"Active binary set to '{binary_name}' (port {matches[0].port})"
+
+    def refresh_instance(self, instance: GhidraInstance):
+        """Check if an instance is still alive, remove if not."""
+        try:
+            resp = requests.get(urljoin(instance.base_url, "ping"), timeout=2)
+            if not resp.ok:
+                with self._lock:
+                    self.instances.pop(instance.port, None)
+        except Exception:
+            with self._lock:
+                self.instances.pop(instance.port, None)
+
+
+# Global connection manager, initialized in main()
+connection_manager: GhidraConnectionManager | None = None
+
+def safe_get(endpoint: str, params: dict = None, binary_name: str = None) -> list:
     """
     Perform a GET request with optional query parameters.
+    Routes to the correct Ghidra instance based on binary_name.
     """
     if params is None:
         params = {}
 
-    url = urljoin(ghidra_server_url, endpoint)
+    if connection_manager is not None:
+        try:
+            instance = connection_manager.get_instance(binary_name)
+            base_url = instance.base_url
+        except RuntimeError as e:
+            return [str(e)]
+    else:
+        base_url = ghidra_server_url
+
+    url = urljoin(base_url, endpoint)
 
     try:
-        response = requests.get(url, params=params, timeout=5)
+        response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.splitlines()
         else:
             return [f"Error {response.status_code}: {response.text.strip()}"]
+    except requests.ConnectionError:
+        if connection_manager is not None:
+            try:
+                inst = connection_manager.get_instance(binary_name)
+                connection_manager.refresh_instance(inst)
+            except RuntimeError:
+                pass
+        return [f"Connection failed to {url}. Instance may have disconnected."]
     except Exception as e:
         return [f"Request failed: {str(e)}"]
 
-def safe_post(endpoint: str, data: dict | str) -> str:
+def safe_post(endpoint: str, data: dict | str, binary_name: str = None) -> str:
+    """
+    Perform a POST request. Routes to the correct Ghidra instance based on binary_name.
+    """
+    if connection_manager is not None:
+        try:
+            instance = connection_manager.get_instance(binary_name)
+            base_url = instance.base_url
+        except RuntimeError as e:
+            return str(e)
+    else:
+        base_url = ghidra_server_url
+
     try:
-        url = urljoin(ghidra_server_url, endpoint)
+        url = urljoin(base_url, endpoint)
         if isinstance(data, dict):
-            response = requests.post(url, data=data, timeout=5)
+            response = requests.post(url, data=data, timeout=HTTP_TIMEOUT)
         else:
-            response = requests.post(url, data=data.encode("utf-8"), timeout=5)
+            response = requests.post(url, data=data.encode("utf-8"), timeout=HTTP_TIMEOUT)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.strip()
         else:
             return f"Error {response.status_code}: {response.text.strip()}"
+    except requests.ConnectionError:
+        if connection_manager is not None:
+            try:
+                inst = connection_manager.get_instance(binary_name)
+                connection_manager.refresh_instance(inst)
+            except RuntimeError:
+                pass
+        return f"Connection failed to {url}. Instance may have disconnected."
     except Exception as e:
         return f"Request failed: {str(e)}"
 
 @mcp.tool()
-def list_methods(offset: int = 0, limit: int = 100) -> list:
+def list_binaries() -> str:
+    """
+    List all connected Ghidra instances and their loaded binaries.
+
+    Scans the configured port range for running GhidraMCP instances and
+    returns details about each one, including program name, path, language,
+    and which instance is currently active.
+
+    Call criteria:
+    - When starting a multi-binary analysis session
+    - When you need to see which binaries are available for analysis
+    - When you want to check which binary is currently selected
+
+    Returns:
+        Formatted list of all connected Ghidra instances with their details.
+    """
+    if connection_manager is None:
+        return "Connection manager not initialized. Use --base-port or --ghidra-server."
+
+    instances = connection_manager.discover()
+    if not instances:
+        return "No Ghidra instances found. Make sure Ghidra is running with the GhidraMCP plugin."
+
+    lines = [f"Found {len(instances)} Ghidra instance(s):\n"]
+    for inst in instances:
+        active = " [ACTIVE]" if inst.program_name == connection_manager.active_binary else ""
+        lines.append(f"  Port {inst.port}:{active}")
+        lines.append(f"    Program: {inst.program_name or '(no program loaded)'}")
+        lines.append(f"    Path:    {inst.program_path or 'N/A'}")
+        lines.append(f"    Language: {inst.language or 'N/A'}")
+        lines.append(f"    Compiler: {inst.compiler or 'N/A'}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def select_binary(binary_name: str) -> str:
+    """
+    Set the active binary for subsequent tool calls.
+
+    When multiple Ghidra instances are running with different binaries,
+    use this to set which binary should be the default target. After
+    selecting a binary, all tool calls without an explicit binary_name
+    will route to this instance.
+
+    Call criteria:
+    - When you want to focus analysis on a specific binary
+    - When tool calls fail because multiple instances are detected
+    - When switching between binaries during multi-binary analysis
+
+    Args:
+        binary_name: The program name of the binary to select (as shown by list_binaries)
+
+    Returns:
+        Confirmation message with the selected binary and its port.
+    """
+    if connection_manager is None:
+        return "Connection manager not initialized."
+
+    try:
+        return connection_manager.set_active(binary_name)
+    except RuntimeError as e:
+        return str(e)
+
+
+@mcp.tool()
+def discover_ghidra_instances() -> str:
+    """
+    Force a rescan of the port range for Ghidra instances.
+
+    Use this after starting or stopping Ghidra instances to update
+    the connection list. This is more thorough than list_binaries
+    as it clears the existing instance list before scanning.
+
+    Call criteria:
+    - After starting a new Ghidra instance
+    - After closing a Ghidra instance
+    - When instances seem stale or unresponsive
+
+    Returns:
+        Summary of discovered Ghidra instances.
+    """
+    if connection_manager is None:
+        return "Connection manager not initialized."
+
+    instances = connection_manager.discover()
+    if not instances:
+        return "No Ghidra instances found on ports {}-{}.".format(
+            connection_manager.base_port,
+            connection_manager.base_port + connection_manager.port_range - 1
+        )
+
+    lines = [f"Discovered {len(instances)} instance(s):"]
+    for inst in instances:
+        lines.append(f"  - {inst.program_name or '(no program)'} on port {inst.port}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_methods(offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
     List all function names in the program with pagination.
+
+    Returns only function names (no addresses). For names with addresses,
+    use list_functions instead. For searching by substring, use
+    search_functions_by_name.
+
+    Call criteria:
+    - When you need a quick overview of all function names in the binary
+    - When you want to browse functions page by page in large binaries
+
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of names to return (default: 100)
+
+    Returns:
+        List of fully-qualified function names (e.g. "jag::engine::init"),
+        one per line, sorted by address order.
     """
-    return safe_get("methods", {"offset": offset, "limit": limit})
+    return safe_get("methods", {"offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def list_classes(offset: int = 0, limit: int = 100) -> list:
+def list_classes(offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
     List all namespace/class names in the program with pagination.
+
+    Returns unique parent namespace names derived from all symbols. In C++
+    binaries these correspond to classes; in C binaries there are typically
+    none. Names use :: delimiters (e.g. "jag::engine").
+
+    Call criteria:
+    - When exploring a C++ binary to understand its class hierarchy
+    - When you need to find the namespace a symbol belongs to
+
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of class names to return (default: 100)
+
+    Returns:
+        List of unique namespace/class names sorted alphabetically,
+        one per line.
     """
-    return safe_get("classes", {"offset": offset, "limit": limit})
+    return safe_get("classes", {"offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def decompile_function(name: str) -> str:
+def decompile_function(name: str, binary_name: str = None) -> str:
     """
     Decompile a specific function by name and return the decompiled C code.
     """
-    return safe_post("decompile", name)
+    return safe_post("decompile", name, binary_name=binary_name)
 
 @mcp.tool()
-def rename_function(old_name: str, new_name: str) -> str:
+def rename_function(old_name: str, new_name: str, binary_name: str = None) -> str:
     """
     Rename a function by its current name to a new user-defined name.
     Both old_name and new_name support C++ qualified names with :: delimiters
     (e.g. "jag::engine::FooBar") which will create proper namespace hierarchies.
     """
-    return safe_post("renameFunction", {"oldName": old_name, "newName": new_name})
+    return safe_post("renameFunction", {"oldName": old_name, "newName": new_name}, binary_name=binary_name)
 
 @mcp.tool()
-def rename_data(address: str, new_name: str) -> str:
+def rename_data(address: str, new_name: str, binary_name: str = None) -> str:
     """
     Rename a data label at the specified address.
     Supports C++ qualified names with :: delimiters (e.g. "jag::engine::myData")
     which will create proper namespace hierarchies.
     """
-    return safe_post("renameData", {"address": address, "newName": new_name})
+    return safe_post("renameData", {"address": address, "newName": new_name}, binary_name=binary_name)
 
 @mcp.tool()
-def list_segments(offset: int = 0, limit: int = 100) -> list:
+def list_segments(offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
-    List all memory segments in the program with pagination.
+    List all memory segments (sections) in the program with pagination.
+
+    Returns the binary's memory layout: .text, .data, .bss, .rodata, etc.
+    Each segment shows its name and address range.
+
+    Call criteria:
+    - When you need to understand the binary's memory layout
+    - When determining which section an address belongs to
+    - When looking for writable vs executable regions
+
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of segments to return (default: 100)
+
+    Returns:
+        List of segments formatted as "SegmentName: StartAddr - EndAddr",
+        one per line.
     """
-    return safe_get("segments", {"offset": offset, "limit": limit})
+    return safe_get("segments", {"offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def list_imports(offset: int = 0, limit: int = 100) -> list:
+def list_imports(offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
-    List imported symbols in the program with pagination.
+    List imported symbols (external library functions/data) with pagination.
+
+    Returns symbols the binary imports from shared libraries (e.g. DLLs, .so).
+    These are the external dependencies the program calls at runtime.
+
+    Call criteria:
+    - When identifying which library functions the binary uses
+    - When looking for security-relevant imports (e.g. malloc, strcpy, socket)
+    - When mapping the binary's external API surface
+
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of imports to return (default: 100)
+
+    Returns:
+        List of imports formatted as "SymbolName -> Address", one per line.
     """
-    return safe_get("imports", {"offset": offset, "limit": limit})
+    return safe_get("imports", {"offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def list_exports(offset: int = 0, limit: int = 100) -> list:
+def list_exports(offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
-    List exported functions/symbols with pagination.
+    List exported functions/symbols (the binary's public API) with pagination.
+
+    Returns symbols marked as external entry points — these are the functions
+    and data the binary exposes for other modules to call or reference.
+
+    Call criteria:
+    - When identifying the binary's public interface (DLL exports, shared lib API)
+    - When looking for the main entry point or exported initialization functions
+    - When analyzing a library to understand its available functionality
+
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of exports to return (default: 100)
+
+    Returns:
+        List of exports formatted as "SymbolName -> Address", one per line.
     """
-    return safe_get("exports", {"offset": offset, "limit": limit})
+    return safe_get("exports", {"offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def list_namespaces(offset: int = 0, limit: int = 100) -> list:
+def list_namespaces(offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
     List all non-global namespaces in the program with pagination.
     Returns fully-qualified namespace paths using :: delimiters (e.g. "jag::engine").
     """
-    return safe_get("namespaces", {"offset": offset, "limit": limit})
+    return safe_get("namespaces", {"offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def list_data_items(offset: int = 0, limit: int = 100) -> list:
+def list_data_items(offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
-    List defined data labels and their values with pagination.
+    List defined data labels (global variables, constants) and their values.
+
+    Returns all data items Ghidra has defined in memory — global variables,
+    initialized constants, vtable pointers, string references, etc.
+
+    Call criteria:
+    - When looking for global variables or constants in the binary
+    - When exploring the data sections (.data, .rodata, .bss)
+    - When searching for specific values or labels
+
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of data items to return (default: 100)
+
+    Returns:
+        List of items formatted as "Address: Label = Value", one per line.
     """
-    return safe_get("data", {"offset": offset, "limit": limit})
+    return safe_get("data", {"offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def search_functions_by_name(query: str, offset: int = 0, limit: int = 100) -> list:
+def search_functions_by_name(query: str, offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
-    Search for functions whose name contains the given substring.
+    Search for functions whose name contains the given substring (case-insensitive).
+
+    Searches both simple names and fully-qualified names (with namespaces).
+    More targeted than list_methods — use this when you know part of a
+    function name. Returns matching functions with their addresses.
+
+    Call criteria:
+    - When looking for a specific function by partial name (e.g. "init", "parse")
+    - When you know a keyword from the function name but not the exact name
+    - Prefer this over list_methods when you have a search term
+
+    Args:
+        query: Substring to match against function names (case-insensitive).
+               Matches both simple name and fully-qualified "ns::name" form.
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of results to return (default: 100)
+
+    Returns:
+        List of matches formatted as "QualifiedName @ Address", sorted
+        alphabetically. Returns error message if query is empty.
     """
     if not query:
         return ["Error: query string is required"]
-    return safe_get("searchFunctions", {"query": query, "offset": offset, "limit": limit})
+    return safe_get("searchFunctions", {"query": query, "offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def rename_variable(function_name: str, old_name: str, new_name: str) -> str:
+def rename_variable(function_name: str, old_name: str, new_name: str, binary_name: str = None) -> str:
     """
     Rename a local variable within a function.
     The function_name supports C++ qualified names with :: delimiters
@@ -152,160 +539,308 @@ def rename_variable(function_name: str, old_name: str, new_name: str) -> str:
         "functionName": function_name,
         "oldName": old_name,
         "newName": new_name
-    })
+    }, binary_name=binary_name)
 
 @mcp.tool()
-def get_function_by_address(address: str) -> str:
+def get_function_by_address(address: str, binary_name: str = None) -> str:
     """
-    Get a function by its address.
+    Get summary information about the function at a specific address.
+
+    Returns the function's name, signature, entry point, and body address
+    range. The address must point to the exact entry point of a function.
+
+    Call criteria:
+    - When you have an address and need to identify which function is there
+    - When you need a function's signature or body address range
+    - When resolving a call target or reference to a function address
+
+    Args:
+        address: Function entry point in hex format (e.g. "0x1400010a0",
+                 "00401000"). Must be the exact start address.
+
+    Returns:
+        Multi-line text with function name, address, signature, entry point,
+        and body start/end addresses. Error message if no function found.
     """
-    return "\n".join(safe_get("get_function_by_address", {"address": address}))
+    return "\n".join(safe_get("get_function_by_address", {"address": address}, binary_name=binary_name))
 
 @mcp.tool()
-def get_current_address() -> str:
+def get_current_address(binary_name: str = None) -> str:
     """
-    Get the address currently selected by the user.
+    Get the address currently selected by the user in the Ghidra GUI.
+
+    Returns the address where the user's cursor is positioned in the
+    Listing or Decompiler view. Useful for interactive workflows where
+    the user navigates to a location and asks the agent to act on it.
+
+    Call criteria:
+    - When the user says "this address", "here", or "the current location"
+    - When you need to know where the user is looking in the binary
+    - Before performing operations on "the selected" address
+
+    Returns:
+        The current cursor address as a hex string (e.g. "00401000"),
+        or an error message if no location is selected.
     """
-    return "\n".join(safe_get("get_current_address"))
+    return "\n".join(safe_get("get_current_address", binary_name=binary_name))
 
 @mcp.tool()
-def get_current_function() -> str:
+def get_current_function(binary_name: str = None) -> str:
     """
-    Get the function currently selected by the user.
+    Get the function containing the user's current cursor position in the Ghidra GUI.
+
+    Returns the name, entry point address, and signature of whatever function
+    the user is currently looking at in the Listing or Decompiler view.
+
+    Call criteria:
+    - When the user says "this function", "the current function", or refers
+      to what they're looking at without specifying a name or address
+    - When you need context about what the user is examining
+
+    Returns:
+        Multi-line text with function name, entry address, and full signature.
+        Error message if the cursor is not inside a function.
     """
-    return "\n".join(safe_get("get_current_function"))
+    return "\n".join(safe_get("get_current_function", binary_name=binary_name))
 
 @mcp.tool()
-def list_functions() -> list:
+def list_functions(binary_name: str = None) -> list:
     """
-    List all functions in the database.
+    List all functions with their entry point addresses (no pagination).
+
+    Returns every function in the program as "Name at Address". WARNING: this
+    returns ALL functions at once with no pagination, which can be very large
+    for big binaries. For paginated browsing use list_methods; for targeted
+    lookup use search_functions_by_name.
+
+    Call criteria:
+    - When you need both function names AND addresses for all functions
+    - Only for small/medium binaries — for large binaries prefer list_methods
+      or search_functions_by_name with pagination
+
+    Returns:
+        List of all functions formatted as "QualifiedName at Address",
+        one per line.
     """
-    return safe_get("list_functions")
+    return safe_get("list_functions", binary_name=binary_name)
 
 @mcp.tool()
-def decompile_function_by_address(address: str) -> str:
+def decompile_function_by_address(address: str, binary_name: str = None) -> str:
     """
-    Decompile a function at the given address.
+    Decompile a function at (or containing) the given address and return C pseudocode.
+
+    The address does not need to be the exact entry point — if the address falls
+    within a function body, that function will be decompiled. The decompiler may
+    take 30-60 seconds for very large functions.
+
+    Call criteria:
+    - When you have a function address and want to read its decompiled C code
+    - When examining code at a specific address found via xrefs or other tools
+    - Prefer this over decompile_function (by name) when you already have an address
+
+    Args:
+        address: Address in hex format (e.g. "0x1400010a0", "00401000").
+                 Can be the entry point or any address within the function body.
+
+    Returns:
+        The full decompiled C pseudocode of the function as a string,
+        or an error message if decompilation fails.
     """
-    return "\n".join(safe_get("decompile_function", {"address": address}))
+    return "\n".join(safe_get("decompile_function", {"address": address}, binary_name=binary_name))
 
 @mcp.tool()
-def disassemble_function(address: str) -> list:
+def disassemble_function(address: str, binary_name: str = None) -> list:
     """
     Get assembly code (address: instruction; comment) for a function.
     """
-    return safe_get("disassemble_function", {"address": address})
+    return safe_get("disassemble_function", {"address": address}, binary_name=binary_name)
 
 @mcp.tool()
-def set_decompiler_comment(address: str, comment: str) -> str:
+def set_decompiler_comment(address: str, comment: str, binary_name: str = None) -> str:
     """
-    Set a comment for a given address in the function pseudocode.
+    Set a pre-comment at an address, visible in the Decompiler pseudocode view.
+
+    This places a comment above the corresponding line in decompiled C output.
+    Use this for annotations that explain high-level logic. For comments in
+    the assembly Listing view, use set_disassembly_comment instead.
+
+    Call criteria:
+    - When annotating decompiled pseudocode with analysis notes
+    - When explaining what a block of decompiled code does
+    - When leaving notes for future analysis in the decompiler view
+
+    Args:
+        address: Address to comment in hex format (e.g. "0x1400010a0").
+        comment: The comment text to set. Replaces any existing pre-comment.
+
+    Returns:
+        Success or failure message.
     """
-    return safe_post("set_decompiler_comment", {"address": address, "comment": comment})
+    return safe_post("set_decompiler_comment", {"address": address, "comment": comment}, binary_name=binary_name)
 
 @mcp.tool()
-def set_disassembly_comment(address: str, comment: str) -> str:
+def set_disassembly_comment(address: str, comment: str, binary_name: str = None) -> str:
     """
-    Set a comment for a given address in the function disassembly.
+    Set an end-of-line (EOL) comment at an address, visible in the Listing (disassembly) view.
+
+    This places a comment at the end of the assembly instruction line. Use this
+    for annotations about specific instructions. For comments in the Decompiler
+    pseudocode view, use set_decompiler_comment instead.
+
+    Call criteria:
+    - When annotating specific assembly instructions with analysis notes
+    - When explaining what an instruction does at the assembly level
+    - When leaving notes visible in the disassembly Listing view
+
+    Args:
+        address: Address to comment in hex format (e.g. "0x1400010a0").
+        comment: The comment text to set. Replaces any existing EOL comment.
+
+    Returns:
+        Success or failure message.
     """
-    return safe_post("set_disassembly_comment", {"address": address, "comment": comment})
+    return safe_post("set_disassembly_comment", {"address": address, "comment": comment}, binary_name=binary_name)
 
 @mcp.tool()
-def rename_function_by_address(function_address: str, new_name: str) -> str:
+def rename_function_by_address(function_address: str, new_name: str, binary_name: str = None) -> str:
     """
     Rename a function by its address.
     Supports C++ qualified names with :: delimiters (e.g. "jag::engine::FooBar")
     which will create proper namespace hierarchies.
     """
-    return safe_post("rename_function_by_address", {"function_address": function_address, "new_name": new_name})
+    return safe_post("rename_function_by_address", {"function_address": function_address, "new_name": new_name}, binary_name=binary_name)
 
 @mcp.tool()
-def set_function_prototype(function_address: str, prototype: str) -> str:
+def set_function_prototype(function_address: str, prototype: str, binary_name: str = None) -> str:
     """
-    Set a function's prototype.
+    Set a function's full prototype (signature) using a C-style declaration string.
+
+    This is the "big hammer" for changing a function's signature — it replaces the
+    return type, name, and all parameters at once. For more surgical changes, prefer
+    the targeted tools: set_return_type, add_parameter, remove_parameter,
+    change_parameter_type, or rename_parameter.
+
+    Call criteria:
+    - When you know the complete correct signature and want to set it all at once
+    - When importing a known function signature from documentation or headers
+    - When the function's entire signature is wrong and needs full replacement
+
+    Args:
+        function_address: Address of the function in hex format (e.g. "0x1400010a0").
+        prototype: Complete C-style function declaration, e.g.
+                   "int processPacket(void* ctx, char* buffer, int length)"
+                   The name in the prototype must match the function's current name
+                   or it may be renamed.
+
+    Returns:
+        Success message, or detailed error/warning information if parsing or
+        application failed.
     """
-    return safe_post("set_function_prototype", {"function_address": function_address, "prototype": prototype})
+    return safe_post("set_function_prototype", {"function_address": function_address, "prototype": prototype}, binary_name=binary_name)
 
 @mcp.tool()
-def set_local_variable_type(function_address: str, variable_name: str, new_type: str) -> str:
+def set_local_variable_type(function_address: str, variable_name: str, new_type: str, binary_name: str = None) -> str:
     """
-    Set a local variable's type.
+    Set the data type of a local variable in a function's decompiled output.
+
+    Changes the type of a variable identified by its name in the decompiled code.
+    The function is decompiled to find the variable, so the name must match exactly
+    what appears in the Decompiler output (e.g. "local_18", "iVar1", or a
+    user-renamed name).
+
+    Call criteria:
+    - When a local variable has the wrong type (e.g. "undefined8" should be "int*")
+    - When applying struct types to local variables after defining structs
+    - When fixing auto-analysis variable types based on how variables are used
+
+    Args:
+        function_address: Address of the containing function in hex format
+                         (e.g. "0x1400010a0"). Can be entry point or any
+                         address within the function body.
+        variable_name: Exact name of the variable as shown in the Decompiler
+                      output (e.g. "local_18", "iVar1", "buffer").
+        new_type: The new data type name. Supports primitives ("int", "char"),
+                  sized types ("dword", "longlong"), pointers ("int*", "void*",
+                  "MyStruct*"), and custom types (any struct/union/enum name).
+
+    Returns:
+        Diagnostic message with type resolution details and success/failure status.
     """
-    return safe_post("set_local_variable_type", {"function_address": function_address, "variable_name": variable_name, "new_type": new_type})
+    return safe_post("set_local_variable_type", {"function_address": function_address, "variable_name": variable_name, "new_type": new_type}, binary_name=binary_name)
 
 @mcp.tool()
-def get_xrefs_to(address: str, offset: int = 0, limit: int = 100) -> list:
+def get_xrefs_to(address: str, offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
     Get all references to the specified address (xref to).
-    
+
     Args:
         address: Target address in hex format (e.g. "0x1400010a0")
         offset: Pagination offset (default: 0)
         limit: Maximum number of references to return (default: 100)
-        
+
     Returns:
         List of references to the specified address
     """
-    return safe_get("xrefs_to", {"address": address, "offset": offset, "limit": limit})
+    return safe_get("xrefs_to", {"address": address, "offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def get_xrefs_from(address: str, offset: int = 0, limit: int = 100) -> list:
+def get_xrefs_from(address: str, offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
     Get all references from the specified address (xref from).
-    
+
     Args:
         address: Source address in hex format (e.g. "0x1400010a0")
         offset: Pagination offset (default: 0)
         limit: Maximum number of references to return (default: 100)
-        
+
     Returns:
         List of references from the specified address
     """
-    return safe_get("xrefs_from", {"address": address, "offset": offset, "limit": limit})
+    return safe_get("xrefs_from", {"address": address, "offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def get_function_xrefs(name: str, offset: int = 0, limit: int = 100) -> list:
+def get_function_xrefs(name: str, offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
     Get all references to the specified function by name.
-    
+
     Args:
         name: Function name to search for
         offset: Pagination offset (default: 0)
         limit: Maximum number of references to return (default: 100)
-        
+
     Returns:
         List of references to the specified function
     """
-    return safe_get("function_xrefs", {"name": name, "offset": offset, "limit": limit})
+    return safe_get("function_xrefs", {"name": name, "offset": offset, "limit": limit}, binary_name=binary_name)
 
 @mcp.tool()
-def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list:
+def list_strings(offset: int = 0, limit: int = 2000, filter: str = None, binary_name: str = None) -> list:
     """
     List all defined strings in the program with their addresses.
-    
+
     Args:
         offset: Pagination offset (default: 0)
         limit: Maximum number of strings to return (default: 2000)
         filter: Optional filter to match within string content
-        
+
     Returns:
         List of strings with their addresses
     """
     params = {"offset": offset, "limit": limit}
     if filter:
         params["filter"] = filter
-    return safe_get("strings", params)
+    return safe_get("strings", params, binary_name=binary_name)
 
 @mcp.tool()
-def create_namespace(namespace_path: str) -> str:
+def create_namespace(namespace_path: str, binary_name: str = None) -> str:
     """
     Create a namespace hierarchy from a :: delimited path (e.g. "jag::engine").
     Creates all intermediate namespaces as needed.
     """
-    return safe_post("createNamespace", {"namespace_path": namespace_path})
+    return safe_post("createNamespace", {"namespace_path": namespace_path}, binary_name=binary_name)
 
 @mcp.tool()
-def move_symbol_to_namespace(address: str, namespace_path: str) -> str:
+def move_symbol_to_namespace(address: str, namespace_path: str, binary_name: str = None) -> str:
     """
     Move the primary symbol at a given address into a namespace.
     The namespace hierarchy is created if it doesn't exist.
@@ -314,10 +849,10 @@ def move_symbol_to_namespace(address: str, namespace_path: str) -> str:
         address: Address of the symbol to move (e.g. "0x1400010a0")
         namespace_path: Target namespace path with :: delimiters (e.g. "jag::engine")
     """
-    return safe_post("moveSymbolToNamespace", {"address": address, "namespace_path": namespace_path})
+    return safe_post("moveSymbolToNamespace", {"address": address, "namespace_path": namespace_path}, binary_name=binary_name)
 
 @mcp.tool()
-def list_namespace_contents(namespace_path: str, offset: int = 0, limit: int = 100) -> list:
+def list_namespace_contents(namespace_path: str, offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
     List the symbols contained within a namespace.
 
@@ -333,12 +868,12 @@ def list_namespace_contents(namespace_path: str, offset: int = 0, limit: int = 1
         "namespace_path": namespace_path,
         "offset": offset,
         "limit": limit
-    })
+    }, binary_name=binary_name)
 
 # ── Data Structure Tools ──────────────────────────────────────────────────
 
 @mcp.tool()
-def create_struct(name: str, size: int, category_path: str = "/") -> str:
+def create_struct(name: str, size: int, category_path: str = "/", binary_name: str = None) -> str:
     """
     Create a new structure (struct) data type in the program's Data Type Manager.
 
@@ -366,12 +901,12 @@ def create_struct(name: str, size: int, category_path: str = "/") -> str:
     Returns:
         Success message confirming creation with name and size, or an error message.
     """
-    return safe_post("createStruct", {"name": name, "size": str(size), "category_path": category_path})
+    return safe_post("createStruct", {"name": name, "size": str(size), "category_path": category_path}, binary_name=binary_name)
 
 
 @mcp.tool()
 def add_struct_field(struct_name: str, offset: int, field_type: str, field_name: str,
-                     field_length: int = 0, comment: str = "") -> str:
+                     field_length: int = 0, comment: str = "", binary_name: str = None) -> str:
     """
     Add or replace a field at a specific byte offset within an existing structure.
 
@@ -413,11 +948,11 @@ def add_struct_field(struct_name: str, offset: int, field_type: str, field_name:
         "field_name": field_name,
         "field_length": str(field_length),
         "comment": comment
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def delete_struct_field(struct_name: str, offset: int) -> str:
+def delete_struct_field(struct_name: str, offset: int, binary_name: str = None) -> str:
     """
     Clear (delete) the field at a specific byte offset within a structure.
 
@@ -443,11 +978,11 @@ def delete_struct_field(struct_name: str, offset: int) -> str:
     return safe_post("deleteStructField", {
         "struct_name": struct_name,
         "offset": str(offset)
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def get_struct_fields(struct_name: str, offset: int = 0, limit: int = 100) -> list:
+def get_struct_fields(struct_name: str, offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
     """
     List all defined fields of a structure with their offsets, types, and sizes.
 
@@ -475,11 +1010,11 @@ def get_struct_fields(struct_name: str, offset: int = 0, limit: int = 100) -> li
         "struct_name": struct_name,
         "offset": offset,
         "limit": limit
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def create_union(name: str, category_path: str = "/") -> str:
+def create_union(name: str, category_path: str = "/", binary_name: str = None) -> str:
     """
     Create a new union data type in the program's Data Type Manager.
 
@@ -503,12 +1038,12 @@ def create_union(name: str, category_path: str = "/") -> str:
     Returns:
         Success message confirming creation, or an error message.
     """
-    return safe_post("createUnion", {"name": name, "category_path": category_path})
+    return safe_post("createUnion", {"name": name, "category_path": category_path}, binary_name=binary_name)
 
 
 @mcp.tool()
 def add_union_field(union_name: str, field_type: str, field_name: str,
-                    field_length: int = 0, comment: str = "") -> str:
+                    field_length: int = 0, comment: str = "", binary_name: str = None) -> str:
     """
     Add a new field (member) to an existing union data type.
 
@@ -540,11 +1075,11 @@ def add_union_field(union_name: str, field_type: str, field_name: str,
         "field_name": field_name,
         "field_length": str(field_length),
         "comment": comment
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def create_enum(name: str, size: int = 4, category_path: str = "/") -> str:
+def create_enum(name: str, size: int = 4, category_path: str = "/", binary_name: str = None) -> str:
     """
     Create a new enumeration (enum) data type in the program's Data Type Manager.
 
@@ -571,11 +1106,11 @@ def create_enum(name: str, size: int = 4, category_path: str = "/") -> str:
     Returns:
         Success message confirming creation with name and size, or an error message.
     """
-    return safe_post("createEnum", {"name": name, "size": str(size), "category_path": category_path})
+    return safe_post("createEnum", {"name": name, "size": str(size), "category_path": category_path}, binary_name=binary_name)
 
 
 @mcp.tool()
-def add_enum_value(enum_name: str, entry_name: str, value: int) -> str:
+def add_enum_value(enum_name: str, entry_name: str, value: int, binary_name: str = None) -> str:
     """
     Add a named constant value to an existing enumeration data type.
 
@@ -606,11 +1141,11 @@ def add_enum_value(enum_name: str, entry_name: str, value: int) -> str:
         "enum_name": enum_name,
         "entry_name": entry_name,
         "value": str(value)
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def get_data_type(name: str) -> str:
+def get_data_type(name: str, binary_name: str = None) -> str:
     """
     Get detailed information about any data type by name, including its fields or values.
 
@@ -641,11 +1176,11 @@ def get_data_type(name: str) -> str:
         - Enum: name, category, length, then each value with name and numeric value
         - Other: name, category, length, class name, and description
     """
-    return "\n".join(safe_get("getDataType", {"name": name}))
+    return "\n".join(safe_get("getDataType", {"name": name}, binary_name=binary_name))
 
 
 @mcp.tool()
-def apply_struct_to_address(address: str, struct_name: str) -> str:
+def apply_struct_to_address(address: str, struct_name: str, binary_name: str = None) -> str:
     """
     Apply a structure data type at a specific memory address in the program listing.
 
@@ -678,13 +1213,185 @@ def apply_struct_to_address(address: str, struct_name: str) -> str:
     return safe_post("applyStructToAddress", {
         "address": address,
         "struct_name": struct_name
-    })
+    }, binary_name=binary_name)
+
+
+@mcp.tool()
+def delete_data_type(name: str, binary_name: str = None) -> str:
+    """
+    Delete any data type (struct, union, enum, typedef, etc.) from the Data Type Manager.
+
+    Permanently removes the named data type. Use this to resolve naming conflicts
+    before recreating a type, or to clean up incorrect type definitions.
+
+    Call criteria:
+    - When a data type needs to be replaced and you want to avoid name conflicts
+    - When cleaning up incorrectly defined structs, unions, or enums
+    - Before recreating a type with a different layout (delete first, then create)
+    - When removing auto-analysis artifacts that are incorrect
+
+    Args:
+        name: Name of the data type to delete (e.g. "MyStruct", "ErrorCode").
+              Searches all categories. Case-insensitive fallback if exact match
+              is not found.
+
+    Returns:
+        Success message confirming removal, or error if the type was not found.
+    """
+    return safe_post("deleteDataType", {"name": name}, binary_name=binary_name)
+
+
+@mcp.tool()
+def rename_data_type(old_name: str, new_name: str, binary_name: str = None) -> str:
+    """
+    Rename an existing data type (struct, union, enum, typedef, etc.) in place.
+
+    Changes the name without deleting and recreating the type, preserving all
+    fields, values, and references to the type throughout the program.
+
+    Call criteria:
+    - When a data type has an auto-generated or incorrect name
+    - When standardizing type names to match documentation or conventions
+    - When you want to rename without losing field definitions
+
+    Args:
+        old_name: Current name of the data type. Searches all categories.
+        new_name: New name for the data type. Must be unique within its category.
+
+    Returns:
+        Success message confirming the rename, or error if the type was not found
+        or the new name conflicts.
+    """
+    return safe_post("renameDataType", {"old_name": old_name, "new_name": new_name}, binary_name=binary_name)
+
+
+@mcp.tool()
+def list_data_types(category_filter: str = "", offset: int = 0, limit: int = 100, binary_name: str = None) -> list:
+    """
+    List data types in the program's Data Type Manager with optional category filtering.
+
+    Returns data types with their kind (Structure, Union, Enum, Typedef, Pointer, etc.),
+    size, and category path. Use the category_filter to narrow results to specific
+    folders in the Data Type Manager tree.
+
+    Call criteria:
+    - When browsing available data types before using them in struct fields or
+      function signatures
+    - When checking if a data type already exists before creating a new one
+    - When exploring auto-analyzed types to understand what Ghidra has found
+    - When looking for types in a specific category (e.g. "/windows" or "/MyProject")
+
+    Args:
+        category_filter: Optional substring to match against category paths.
+                         Only types whose category contains this string are returned.
+                         Empty string (default) returns all types.
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of types to return (default: 100)
+
+    Returns:
+        List of types formatted as "Name [Kind] (N bytes) - /Category/Path",
+        one per line, with pagination.
+    """
+    params = {"offset": offset, "limit": limit}
+    if category_filter:
+        params["category_filter"] = category_filter
+    return safe_get("listDataTypes", params, binary_name=binary_name)
+
+
+@mcp.tool()
+def delete_union_field(union_name: str, ordinal: int, binary_name: str = None) -> str:
+    """
+    Remove a field from a union by its ordinal (index) position.
+
+    Deletes the field at the specified ordinal from the union. Remaining fields
+    shift their ordinals down. Use get_data_type to inspect current ordinals
+    before deleting.
+
+    Call criteria:
+    - When a union field is incorrect or no longer needed
+    - When restructuring a union definition
+    - When cleaning up auto-analysis artifacts in a union
+
+    Args:
+        union_name: Name of the target union. Must exist in the Data Type Manager.
+        ordinal: 0-based index of the field to remove. Use get_data_type to see
+                 current ordinals.
+
+    Returns:
+        Success message confirming removal, or error if the union was not found
+        or the ordinal is out of range.
+    """
+    return safe_post("deleteUnionField", {
+        "union_name": union_name,
+        "ordinal": str(ordinal)
+    }, binary_name=binary_name)
+
+
+@mcp.tool()
+def delete_enum_value(enum_name: str, entry_name: str, binary_name: str = None) -> str:
+    """
+    Remove a named constant from an enum by its entry name.
+
+    Deletes the specified name-value pair from the enum. Use get_data_type to
+    inspect current enum values before deleting.
+
+    Call criteria:
+    - When an enum entry is incorrect or duplicated
+    - When cleaning up enum definitions after re-analysis
+    - When an enum value was assigned the wrong name
+
+    Args:
+        enum_name: Name of the target enum. Must exist in the Data Type Manager.
+        entry_name: Name of the enum constant to remove (e.g. "MSG_INVALID").
+
+    Returns:
+        Success message confirming removal, or error if the enum or entry was
+        not found.
+    """
+    return safe_post("deleteEnumValue", {
+        "enum_name": enum_name,
+        "entry_name": entry_name
+    }, binary_name=binary_name)
+
+
+@mcp.tool()
+def create_typedef(name: str, base_type: str, category_path: str = "/", binary_name: str = None) -> str:
+    """
+    Create a type alias (typedef) for an existing data type.
+
+    Creates a new named type that is an alias for the base type, similar to
+    C's "typedef base_type name;". Useful for defining Windows-style type
+    names (e.g. HANDLE = void*, DWORD = uint) or application-specific aliases.
+
+    Call criteria:
+    - When creating named aliases for common types (e.g. HANDLE, LPVOID)
+    - When you want to make decompiled code more readable with domain-specific
+      type names
+    - When importing type definitions from documentation that use typedefs
+
+    Args:
+        name: Name for the new typedef (e.g. "HANDLE", "CALLBACK_PTR").
+              Must be unique within the given category path.
+        base_type: The underlying data type name. Supports primitives ("int",
+                   "void"), pointers ("void*", "char*"), and any existing
+                   type name in the program.
+        category_path: Category path in the Data Type Manager tree (default: "/").
+
+    Returns:
+        Success message confirming creation, or error if the base type could
+        not be resolved.
+    """
+    return safe_post("createTypedef", {
+        "name": name,
+        "base_type": base_type,
+        "category_path": category_path
+    }, binary_name=binary_name)
 
 
 # ── Signature Refactoring Tools ────────────────────────────────────────────
 
 @mcp.tool()
-def get_function_signature(address: str) -> str:
+def get_function_signature(address: str, binary_name: str = None) -> str:
     """
     Retrieve the full signature details of a function at the specified address.
 
@@ -716,11 +1423,11 @@ def get_function_signature(address: str) -> str:
         - Parameter Count: number of parameters
         - One line per parameter with type, name, ordinal, and storage
     """
-    return "\n".join(safe_get("getFunctionSignature", {"address": address}))
+    return "\n".join(safe_get("getFunctionSignature", {"address": address}, binary_name=binary_name))
 
 
 @mcp.tool()
-def set_return_type(function_address: str, return_type: str) -> str:
+def set_return_type(function_address: str, return_type: str, binary_name: str = None) -> str:
     """
     Change the return type of a function at the specified address.
 
@@ -749,11 +1456,11 @@ def set_return_type(function_address: str, return_type: str) -> str:
         Success message confirming the return type change, or an error message
         if the function was not found or the type could not be resolved.
     """
-    return safe_post("setReturnType", {"function_address": function_address, "return_type": return_type})
+    return safe_post("setReturnType", {"function_address": function_address, "return_type": return_type}, binary_name=binary_name)
 
 
 @mcp.tool()
-def add_parameter(function_address: str, param_name: str, param_type: str, index: int = -1) -> str:
+def add_parameter(function_address: str, param_name: str, param_type: str, index: int = -1, binary_name: str = None) -> str:
     """
     Add a new parameter to a function at the specified address.
 
@@ -793,11 +1500,11 @@ def add_parameter(function_address: str, param_name: str, param_type: str, index
         "param_name": param_name,
         "param_type": param_type,
         "index": str(index)
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def remove_parameter(function_address: str, index: int) -> str:
+def remove_parameter(function_address: str, index: int, binary_name: str = None) -> str:
     """
     Remove a parameter from a function by its index position.
 
@@ -828,11 +1535,11 @@ def remove_parameter(function_address: str, index: int) -> str:
     return safe_post("removeParameter", {
         "function_address": function_address,
         "index": str(index)
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def change_parameter_type(function_address: str, index: int, new_type: str) -> str:
+def change_parameter_type(function_address: str, index: int, new_type: str, binary_name: str = None) -> str:
     """
     Change the data type of a specific parameter in a function's signature.
 
@@ -870,11 +1577,11 @@ def change_parameter_type(function_address: str, index: int, new_type: str) -> s
         "function_address": function_address,
         "index": str(index),
         "new_type": new_type
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def rename_parameter(function_address: str, index: int, new_name: str) -> str:
+def rename_parameter(function_address: str, index: int, new_name: str, binary_name: str = None) -> str:
     """
     Rename a specific parameter in a function's signature by its index.
 
@@ -909,11 +1616,11 @@ def rename_parameter(function_address: str, index: int, new_name: str) -> str:
         "function_address": function_address,
         "index": str(index),
         "new_name": new_name
-    })
+    }, binary_name=binary_name)
 
 
 @mcp.tool()
-def set_calling_convention(function_address: str, calling_convention: str) -> str:
+def set_calling_convention(function_address: str, calling_convention: str, binary_name: str = None) -> str:
     """
     Set the calling convention of a function at the specified address.
 
@@ -950,13 +1657,17 @@ def set_calling_convention(function_address: str, calling_convention: str) -> st
     return safe_post("setCallingConvention", {
         "function_address": function_address,
         "calling_convention": calling_convention
-    })
+    }, binary_name=binary_name)
 
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
-    parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
-                        help=f"Ghidra server URL, default: {DEFAULT_GHIDRA_SERVER}")
+    parser.add_argument("--ghidra-server", type=str, default=None,
+                        help="Ghidra server URL for legacy single-instance mode")
+    parser.add_argument("--base-port", type=int, default=8080,
+                        help="Base port to scan for Ghidra instances (default: 8080)")
+    parser.add_argument("--port-range", type=int, default=10,
+                        help="Number of ports to scan starting from base-port (default: 10)")
     parser.add_argument("--mcp-host", type=str, default="127.0.0.1",
                         help="Host to run MCP server on (only used for sse), default: 127.0.0.1")
     parser.add_argument("--mcp-port", type=int,
@@ -964,20 +1675,36 @@ def main():
     parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"],
                         help="Transport protocol for MCP, default: stdio")
     args = parser.parse_args()
-    
-    # Use the global variable to ensure it's properly updated
-    global ghidra_server_url
+
+    global ghidra_server_url, connection_manager
+
     if args.ghidra_server:
+        # Legacy single-instance mode
         ghidra_server_url = args.ghidra_server
-    
+        connection_manager = None
+        logger.info(f"Legacy mode: connecting to Ghidra server at {ghidra_server_url}")
+    else:
+        # Multi-instance mode
+        port_range = args.port_range
+        connection_manager = GhidraConnectionManager(
+            base_port=args.base_port,
+            port_range=port_range,
+        )
+        instances = connection_manager.discover()
+        if instances:
+            logger.info(f"Discovered {len(instances)} Ghidra instance(s)")
+            for inst in instances:
+                logger.info(f"  - {inst.program_name or '(no program)'} on port {inst.port}")
+        else:
+            logger.info(f"No Ghidra instances found on ports {args.base_port}-{args.base_port + port_range - 1}. "
+                       f"Will scan on demand when tools are called.")
+
     if args.transport == "sse":
         try:
-            # Set up logging
             log_level = logging.INFO
             logging.basicConfig(level=log_level)
             logging.getLogger().setLevel(log_level)
 
-            # Configure MCP settings
             mcp.settings.log_level = "INFO"
             if args.mcp_host:
                 mcp.settings.host = args.mcp_host
@@ -989,7 +1716,6 @@ def main():
             else:
                 mcp.settings.port = 8081
 
-            logger.info(f"Connecting to Ghidra server at {ghidra_server_url}")
             logger.info(f"Starting MCP server on http://{mcp.settings.host}:{mcp.settings.port}/sse")
             logger.info(f"Using transport: {args.transport}")
 
